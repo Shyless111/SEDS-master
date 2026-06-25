@@ -64,6 +64,10 @@ bash scripts/train_h2s.sh
 # train the model on PHOENIX-2014-T dataset.
 bash scripts/train_ph.sh
 ```
+
+## Git Workflow
+For this repository's recommended branch naming and experiment workflow, see [BRANCHING.md](BRANCHING.md).
+
 ## Evaluation
 We provide the pre-trained models in [[BaiduDrive (password: seds)](https://pan.baidu.com/s/1zdI1uS9h-bg39ZdsQuRzEg].
 You can evaluate the models on the different datasets by running the following command:
