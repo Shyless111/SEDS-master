@@ -1,0 +1,34 @@
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Virtual environments and local tooling
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+
+# Training outputs and runtime logs
+result_train/
+nohup.out
+*.log
+
+# Checkpoints and pretrained weights
+ckpt/
+*.pth
+*.pt
+*.bin
+
+# Local datasets and archives
+Datasets/
+data_csl/*.pkl
+data_h2/*.pkl
+data_ph/*.pkl
+
+# OS/editor junk
+.DS_Store
+Thumbs.db
+
+# Local assistant metadata
+.codex/
+.agents/
