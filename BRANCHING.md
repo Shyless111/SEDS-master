@@ -96,6 +96,22 @@ exp: tune probabilistic embedding count to 8
 paper: freeze bs128 e500 ablation setup
 ```
 
+## Quick Checkpoints
+
+When you want to save the current code state before another experiment or refactor, use:
+
+```bash
+bash scripts/save_checkpoint.sh
+```
+
+Or add a custom message:
+
+```bash
+bash scripts/save_checkpoint.sh "exp: adjust dsl evaluation path"
+```
+
+This is useful for frequent research iterations when you want to switch branches or compare code states later.
+
 ## What Should Reach `main`
 
 Good candidates:
