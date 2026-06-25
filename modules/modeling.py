@@ -302,8 +302,8 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
             i2t_chunks.append(i2t)
             t2i_chunks.append(t2i)
 
-        i2t_sim = torch.cat(i2t_chunks, dim=1).t()
-        t2i_sim = torch.cat(t2i_chunks, dim=1).t()
+        i2t_sim = torch.cat(i2t_chunks, dim=1)
+        t2i_sim = torch.cat(t2i_chunks, dim=1)
         return i2t_sim, t2i_sim
 
     def weighted_token_wise_intersection(self, text_token, frame_token, text_valid_mask, video_valid_mask):
@@ -376,9 +376,9 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
         prob_video = self.probabilistic_video(video_pooled, frame_token, video_valid_mask)
         prob_text = self.probabilistic_text(text_pooled, text_token, text_valid_mask)
 
-        # Keep evaluation/training interfaces consistent with the rest of this codebase:
-        # rows are videos, columns are texts.
-        retrieve_logits = logit_scale * wti_logits.t()
+        # Keep the retrieval interface consistent across training/evaluation:
+        # rows are texts, columns are videos.
+        retrieve_logits = logit_scale * wti_logits
 
         if not self.training:
             zero = retrieve_logits.new_zeros(())
@@ -471,7 +471,7 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
                 sim_fg_i2t, sim_fg_t2i = self._compute_filip_similarity(
                     text_hidden, text_valid_mask, video_hidden, video_valid_mask, logit_scale
                 )
-                loss_fg = (self.loss_fct(sim_fg_i2t) + self.loss_fct(sim_fg_t2i.t())) / 2
+                loss_fg = (self.loss_fct(sim_fg_t2i) + self.loss_fct(sim_fg_i2t.t())) / 2
                 zero = loss_fg.detach().new_zeros(())
                 if self.filip_only:
                     return loss_fg, zero, zero, zero, loss_fg
@@ -641,11 +641,11 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
                 sim_tv = sim_fg
             else:
                 v = video_global / video_global.norm(dim=-1, keepdim=True)
-                sim_tv = logit_scale * v @ t.t()  # [n_video, n_text]
+                sim_tv = logit_scale * t @ v.t()  # [n_text, n_video]
                 sim_tv = (1.0 - self.filip_retrieval_weight) * sim_tv + self.filip_retrieval_weight * sim_fg
         else:
             v = video_global / video_global.norm(dim=-1, keepdim=True)
-            sim_tv = logit_scale * v @ t.t()  # [n_video, n_text]
+            sim_tv = logit_scale * t @ v.t()  # [n_text, n_video]
         if not self.use_pose:
             return sim_tv, None, None
 
@@ -653,7 +653,7 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
         p = pose_global / pose_global.norm(dim=-1, keepdim=True)
         f = fused_global / fused_global.norm(dim=-1, keepdim=True)
 
-        sim_tp = logit_scale * p @ t.t()  # [n_pose(=video), n_text]
-        sim_tf = logit_scale * f @ t.t()  # [n_fused(=video), n_text]
+        sim_tp = logit_scale * t @ p.t()  # [n_text, n_pose(=video)]
+        sim_tf = logit_scale * t @ f.t()  # [n_text, n_fused(=video)]
 
         return sim_tv, sim_tp, sim_tf

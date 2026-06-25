@@ -500,14 +500,14 @@ def _run_on_single_gpu_new_mix(model, batch_list_v, batch_list_t, batch_sequence
         sim_matrix_tv = []
         sim_matrix_tp = []
         sim_matrix_tf = []
-        for idx1, b1 in enumerate(batch_list_v):
-            pose_global = batch_visual_output_pose_list[idx1] if batch_visual_output_pose_list is not None else None
-            video_outputs = batch_visual_output_rgb_list[idx1]
+        for idx2, b2 in enumerate(batch_list_t):
+            text_outputs = batch_sequence_output_list[idx2]
             each_row_tv = []
             each_row_tp = []
             each_row_tf = []
-            for idx2, b2 in enumerate(batch_list_t):
-                text_outputs = batch_sequence_output_list[idx2]
+            for idx1, b1 in enumerate(batch_list_v):
+                pose_global = batch_visual_output_pose_list[idx1] if batch_visual_output_pose_list is not None else None
+                video_outputs = batch_visual_output_rgb_list[idx1]
 
                 sim_tv, sim_tp, sim_tf = model.get_global_similarity(
                     text_outputs["global"],
@@ -646,11 +646,11 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu,istrain):
 
             def apply_dual_softmax(sim_matrix):
                 sim_tensor = torch.from_numpy(sim_matrix)
-                weights = F.softmax(sim_tensor, dim=0)
-                scale = sim_tensor.shape[0]
+                weights = F.softmax(sim_tensor, dim=1)
+                scale = sim_tensor.shape[1]
                 if args.uatvr_dsl_mode == "bidir":
-                    weights = weights * F.softmax(sim_tensor, dim=1)
-                    scale *= sim_tensor.shape[1]
+                    weights = weights * F.softmax(sim_tensor, dim=0)
+                    scale *= sim_tensor.shape[0]
                 sim_tensor = sim_tensor * weights * scale
                 return sim_tensor.detach().cpu().numpy()
 
@@ -675,19 +675,20 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu,istrain):
         sim_matrix_new_tf = []
 
         for s_, e_ in zip([0] + cut_off_points2len_[:-1], cut_off_points2len_):
-            sim_matrix_new_tv.append(np.concatenate((sim_matrix_tv[s_:e_],
-                                                  np.full((max_length-e_+s_, sim_matrix_tv.shape[1]), -np.inf)), axis=0))
+            group_length = e_ - s_
+            sim_matrix_new_tv.append(np.concatenate((sim_matrix_tv[:, s_:e_],
+                                                  np.full((sim_matrix_tv.shape[0], max_length - group_length), -np.inf)), axis=1))
             if args.use_pose:
-                sim_matrix_new_tp.append(np.concatenate((sim_matrix_tp[s_:e_],
-                                                      np.full((max_length-e_+s_, sim_matrix_tp.shape[1]), -np.inf)), axis=0))
-                sim_matrix_new_tf.append(np.concatenate((sim_matrix_tf[s_:e_],
-                                                      np.full((max_length-e_+s_, sim_matrix_tf.shape[1]), -np.inf)), axis=0))
+                sim_matrix_new_tp.append(np.concatenate((sim_matrix_tp[:, s_:e_],
+                                                      np.full((sim_matrix_tp.shape[0], max_length - group_length), -np.inf)), axis=1))
+                sim_matrix_new_tf.append(np.concatenate((sim_matrix_tf[:, s_:e_],
+                                                      np.full((sim_matrix_tf.shape[0], max_length - group_length), -np.inf)), axis=1))
 
-        # shape: [num_groups, max_length, num_text]
-        sim_matrix_tv = np.stack(tuple(sim_matrix_new_tv), axis=0)
+        # shape: [num_text, num_groups, max_length]
+        sim_matrix_tv = np.stack(tuple(sim_matrix_new_tv), axis=1)
         if args.use_pose:
-            sim_matrix_tp = np.stack(tuple(sim_matrix_new_tp), axis=0)
-            sim_matrix_tf = np.stack(tuple(sim_matrix_new_tf), axis=0)
+            sim_matrix_tp = np.stack(tuple(sim_matrix_new_tp), axis=1)
+            sim_matrix_tf = np.stack(tuple(sim_matrix_new_tf), axis=1)
 
         if args.do_eval:
             logger.info(f"after reshape, sim matrix save to {args.output_dir}")
