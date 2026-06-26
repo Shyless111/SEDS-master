@@ -122,6 +122,8 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
         self.filip_chunk_size = getattr(task_config, "filip_chunk_size", 32)
         self.filip_softmax_temp = getattr(task_config, "tau", 0.07)
         self.filip_only = getattr(task_config, "filip_only", False)
+        self.mean_nce_weight = getattr(task_config, "mean_nce_weight", 0.1)
+        self.use_mean_nce = self.mean_nce_weight > 0
 
         if self.filip_only and not self.use_filip:
             raise ValueError("`--filip_only` requires `--sim_header Filip`.")
@@ -236,6 +238,7 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
             self.uncertain_net_text = UncertaintyModuleImage(embed_dim, embed_dim, embed_dim // 2)
             self.n_video_samples = getattr(task_config, "n_video_embeddings", 7)
             self.n_text_samples = getattr(task_config, "n_text_embeddings", 7)
+            self.token_interaction_mode = getattr(task_config, "token_interaction_mode", "weighted")
             self.uatvr_mil_weight = getattr(task_config, "uatvr_mil_weight", 1e-2)
             self.uatvr_kl_weight = getattr(task_config, "uatvr_kl_weight", 1e-4)
             self.text_weight_fc = nn.Sequential(
@@ -269,6 +272,16 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
         mask = valid_mask.to(hidden.dtype).unsqueeze(-1)
         denom = mask.sum(dim=1).clamp_min(1.0)
         return (hidden * mask).sum(dim=1) / denom
+
+    def _compute_mean_nce_loss(self, text_hidden, text_valid_mask, video_hidden, video_valid_mask, logit_scale):
+        text_pooled = self._masked_mean_pooling(text_hidden, text_valid_mask)
+        video_pooled = self._masked_mean_pooling(video_hidden, video_valid_mask)
+
+        text_pooled = text_pooled / text_pooled.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        video_pooled = video_pooled / video_pooled.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+
+        sim_mean = logit_scale * text_pooled @ video_pooled.t()
+        return (self.loss_fct(sim_mean) + self.loss_fct(sim_mean.t())) / 2
 
     def _compute_filip_similarity(self, text_hidden, text_valid_mask, video_hidden, video_valid_mask, logit_scale):
         text_hidden = text_hidden / text_hidden.norm(dim=-1, keepdim=True).clamp_min(1e-6)
@@ -326,6 +339,28 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
         v2t_logits = torch.einsum("abv,bv->ab", v2t_logits, video_weight)
         return (t2v_logits + v2t_logits) / 2.0
 
+    def token_wise_interaction(self, text_token, frame_token, text_valid_mask, video_valid_mask):
+        retrieve_logits = torch.einsum("atd,bvd->abtv", text_token, frame_token)
+        retrieve_logits = torch.einsum(
+            "abtv,at->abtv",
+            retrieve_logits,
+            text_valid_mask.to(retrieve_logits.dtype),
+        )
+        retrieve_logits = torch.einsum(
+            "abtv,bv->abtv",
+            retrieve_logits,
+            video_valid_mask.to(retrieve_logits.dtype),
+        )
+
+        text_sum = text_valid_mask.sum(dim=-1).clamp_min(1).to(retrieve_logits.dtype)
+        video_sum = video_valid_mask.sum(dim=-1).clamp_min(1).to(retrieve_logits.dtype)
+
+        t2v_logits = retrieve_logits.max(dim=-1).values
+        v2t_logits = retrieve_logits.max(dim=-2).values
+        t2v_logits = torch.sum(t2v_logits, dim=2) / text_sum.unsqueeze(1)
+        v2t_logits = torch.sum(v2t_logits, dim=2) / video_sum.unsqueeze(0)
+        return (t2v_logits + v2t_logits) / 2.0
+
     def probabilistic_video(self, video_pooled, videos, video_valid_mask):
         output = {}
         pad_mask = ~video_valid_mask
@@ -369,9 +404,14 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
         video_pooled = self._masked_mean_pooling(frame_token, video_valid_mask)
         video_pooled = video_pooled / video_pooled.norm(dim=-1, keepdim=True).clamp_min(1e-6)
 
-        wti_logits = self.weighted_token_wise_intersection(
-            text_token, frame_token, text_valid_mask, video_valid_mask
-        )
+        if self.token_interaction_mode == "unweighted":
+            wti_logits = self.token_wise_interaction(
+                text_token, frame_token, text_valid_mask, video_valid_mask
+            )
+        else:
+            wti_logits = self.weighted_token_wise_intersection(
+                text_token, frame_token, text_valid_mask, video_valid_mask
+            )
 
         prob_video = self.probabilistic_video(video_pooled, frame_token, video_valid_mask)
         prob_text = self.probabilistic_text(text_pooled, text_token, text_valid_mask)
@@ -423,7 +463,7 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
             input_ids, token_type_ids, attention_mask, right_batch, left_batch, body_batch, shaped=True)
 
         if self.training:
-            loss, loss_tv, loss_tp, loss_vp, loss_tf = self.compute_loss(
+            loss, loss_tv, loss_tp, loss_vp, loss_tf, loss_mean_nce = self.compute_loss(
                 text_outputs["global"],
                 visual_outputs["pose_global"],
                 visual_outputs["video_global"],
@@ -432,7 +472,7 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
                 video_hidden=visual_outputs.get("video_hidden"),
                 video_valid_mask=visual_outputs.get("video_valid_mask"),
             )
-            return loss, loss_tv, loss_tp, loss_vp, loss_tf
+            return loss, loss_tv, loss_tp, loss_vp, loss_tf, loss_mean_nce
         else:
             return None
 
@@ -449,7 +489,7 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
             if self.use_pose:
                 pose_global = allgather(pose_global.contiguous(), self.task_config)
             video_global = allgather(video_global.contiguous(), self.task_config)
-            if (self.use_filip or self.use_uatvr_head) and text_hidden is not None:
+            if (self.use_filip or self.use_uatvr_head or self.use_mean_nce) and text_hidden is not None:
                 text_hidden = allgather(text_hidden.contiguous(), self.task_config)
                 text_valid_mask = allgather(text_valid_mask.float(), self.task_config).bool()
                 video_hidden = allgather(video_hidden.contiguous(), self.task_config)
@@ -457,6 +497,12 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
             torch.distributed.barrier()
 
         logit_scale = self.clip.logit_scale.exp()
+        zero = text_global.detach().new_zeros(())
+        loss_mean_nce = zero
+        if self.use_mean_nce and text_hidden is not None and video_hidden is not None:
+            loss_mean_nce = self._compute_mean_nce_loss(
+                text_hidden, text_valid_mask, video_hidden, video_valid_mask, logit_scale
+            )
         if not self.use_pose:
             if self.use_uatvr_head and text_hidden is not None and video_hidden is not None:
                 sim_tv, mil_loss, kl_loss = self.compute_uatvr_losses(
@@ -464,9 +510,9 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
                 )
                 loss_tv = (self.loss_fct(sim_tv) + self.loss_fct(sim_tv.t())) / 2
                 aux_loss = self.uatvr_mil_weight * mil_loss + self.uatvr_kl_weight * kl_loss
-                total_loss = loss_tv + aux_loss
+                total_loss = loss_tv + aux_loss + self.mean_nce_weight * loss_mean_nce
                 zero = loss_tv.detach().new_zeros(())
-                return total_loss, loss_tv, zero, zero, aux_loss
+                return total_loss, loss_tv, zero, zero, aux_loss, loss_mean_nce
             if self.use_filip and text_hidden is not None:
                 sim_fg_i2t, sim_fg_t2i = self._compute_filip_similarity(
                     text_hidden, text_valid_mask, video_hidden, video_valid_mask, logit_scale
@@ -474,19 +520,21 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
                 loss_fg = (self.loss_fct(sim_fg_t2i) + self.loss_fct(sim_fg_i2t.t())) / 2
                 zero = loss_fg.detach().new_zeros(())
                 if self.filip_only:
-                    return loss_fg, zero, zero, zero, loss_fg
+                    total_loss = loss_fg + self.mean_nce_weight * loss_mean_nce
+                    return total_loss, zero, zero, zero, loss_fg, loss_mean_nce
                 t = text_global / text_global.norm(dim=-1, keepdim=True)
                 v = video_global / video_global.norm(dim=-1, keepdim=True)
                 sim_tv = logit_scale * t @ v.t()
                 loss_tv = (self.loss_fct(sim_tv) + self.loss_fct(sim_tv.t())) / 2
-                total_loss = loss_tv + self.filip_loss_weight * loss_fg
-                return total_loss, loss_tv, zero, zero, loss_fg
+                total_loss = loss_tv + self.filip_loss_weight * loss_fg + self.mean_nce_weight * loss_mean_nce
+                return total_loss, loss_tv, zero, zero, loss_fg, loss_mean_nce
             t = text_global / text_global.norm(dim=-1, keepdim=True)
             v = video_global / video_global.norm(dim=-1, keepdim=True)
             sim_tv = logit_scale * t @ v.t()
             loss_tv = (self.loss_fct(sim_tv) + self.loss_fct(sim_tv.t())) / 2
             zero = loss_tv.detach().new_zeros(())
-            return loss_tv, loss_tv, zero, zero, zero
+            total_loss = loss_tv + self.mean_nce_weight * loss_mean_nce
+            return total_loss, loss_tv, zero, zero, zero, loss_mean_nce
 
         t = text_global / text_global.norm(dim=-1, keepdim=True)
         v = video_global / video_global.norm(dim=-1, keepdim=True)
@@ -505,8 +553,8 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
         loss_vp = (self.loss_fct(sim_vp) + self.loss_fct(sim_vp.t())) / 2
         loss_tf = (self.loss_fct(sim_tf) + self.loss_fct(sim_tf.t())) / 2
 
-        loss = loss_tv
-        return loss, loss_tv, loss_tp, loss_vp, loss_tf
+        loss = loss_tv + self.mean_nce_weight * loss_mean_nce
+        return loss, loss_tv, loss_tp, loss_vp, loss_tf, loss_mean_nce
 
     def get_sequence_output(self, input_ids, token_type_ids, attention_mask, shaped=False, get_hidden=True):
         if shaped is False:
@@ -515,7 +563,7 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
             attention_mask = attention_mask.view(-1, attention_mask.shape[-1])
 
         if self.use_hf_text_encoder:
-            if get_hidden and (self.use_filip or self.use_uatvr_head):
+            if get_hidden and (self.use_filip or self.use_uatvr_head or self.use_mean_nce):
                 text_global, text_hidden = self._encode_text_with_hf(input_ids, attention_mask, return_hidden=True)
                 return {
                     "global": text_global,
@@ -526,7 +574,7 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
             text_global = self._encode_text_with_hf(input_ids, attention_mask, return_hidden=False)
             return {"global": text_global}
 
-        if get_hidden and (self.use_filip or self.use_uatvr_head):
+        if get_hidden and (self.use_filip or self.use_uatvr_head or self.use_mean_nce):
             _, text_hidden = self.clip.encode_text(input_ids, return_hidden=True)
             text_hidden = text_hidden.float()
             text_global = text_hidden[torch.arange(text_hidden.shape[0]), input_ids.argmax(dim=-1)]
@@ -593,7 +641,7 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
         pose_global = None
         if self.use_pose:
             pose_global = self.clip.encode_image(video_pose, return_hidden=False, video_mask=video_mask, video_frame=video_frame).float()  # B, 512
-        if get_hidden and (self.use_filip or self.use_uatvr_head):
+        if get_hidden and (self.use_filip or self.use_uatvr_head or self.use_mean_nce):
             _, video_hidden = self.clip_rgb.encode_image(video_rgb, return_hidden=True, video_mask=video_mask, video_frame=video_frame)
             video_hidden = video_hidden.float()
             video_global = video_hidden[:, 0, :]

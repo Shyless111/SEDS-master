@@ -18,8 +18,10 @@ UATVR_MIL_WEIGHT="${UATVR_MIL_WEIGHT:-1e-2}"
 UATVR_KL_WEIGHT="${UATVR_KL_WEIGHT:-1e-4}"
 N_VIDEO_EMBEDDINGS="${N_VIDEO_EMBEDDINGS:-7}"
 N_TEXT_EMBEDDINGS="${N_TEXT_EMBEDDINGS:-7}"
+OPTIMIZER="${OPTIMIZER:-bertadam}"
+MEAN_NCE_WEIGHT="${MEAN_NCE_WEIGHT:-0}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
-USE_SWANLAB="${USE_SWANLAB:-0}"
+USE_SWANLAB="${USE_SWANLAB:-1}"
 SWANLAB_PROJECT="${SWANLAB_PROJECT:-SEDS}"
 SWANLAB_EXPERIMENT_NAME="${SWANLAB_EXPERIMENT_NAME:-}"
 OUTPUT_DIR="result_train/h2s_bs${BATCH_SIZE}_${RUN_TAG}_${TIME_NOW}"
@@ -38,6 +40,8 @@ main_task_retrieval.py --do_train --num_thread_reader="${NUM_WORKERS}" \
 --batch_size_val "${BATCH_SIZE_VAL}" \
 --datatype h2s_pose --coef_lr 1. --freeze_layer_num 0 \
 --linear_patch 2d --sim_header Filip --filip_only \
+--optimizer "${OPTIMIZER}" \
+--mean_nce_weight "${MEAN_NCE_WEIGHT}" \
 --pretrained_clip_name ViT-B/32)
 
 if [ "${USE_CLIP_TEXT_ENCODER}" != "1" ]; then

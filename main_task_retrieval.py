@@ -3,6 +3,7 @@ from __future__ import division
 from __future__ import unicode_literals
 from __future__ import print_function
 from datetime import datetime
+import math
 import torch
 import torch.optim as optim
 import numpy as np
@@ -10,7 +11,7 @@ import random
 import pickle as pkl
 import os
 import torch.nn.functional as F
-from metrics import tensor_text_to_video_metrics, tensor_video_to_text_metrics
+from metrics import compute_metrics, tensor_text_to_video_metrics, tensor_video_to_text_sim
 import time
 import argparse
 from modules.tokenization_clip import SimpleTokenizer as ClipTokenizer
@@ -70,11 +71,14 @@ def get_args(description='CLCL on Retrieval Task'):
     parser.add_argument("--filip_retrieval_weight", default=0.5, type=float, help="Weight for FILIP fine-grained similarity during retrieval.")
     parser.add_argument("--filip_chunk_size", default=32, type=int, help="Chunk size for FILIP pairwise token similarity.")
     parser.add_argument("--filip_only", action='store_true', help="Use only FILIP fine-grained similarity for training loss and retrieval.")
+    parser.add_argument("--mean_nce_weight", default=0.0, type=float, help="Weight for mean pooled text-video InfoNCE loss.")
     parser.add_argument("--use_uatvr_head", action='store_true', help="Enable UATVR probabilistic retrieval head.")
     parser.add_argument("--uatvr_mil_weight", default=1e-2, type=float, help="Weight for UATVR MIL loss.")
     parser.add_argument("--uatvr_kl_weight", default=1e-4, type=float, help="Weight for UATVR KL loss.")
     parser.add_argument("--n_video_embeddings", default=7, type=int, help="Number of sampled probabilistic video embeddings.")
     parser.add_argument("--n_text_embeddings", default=7, type=int, help="Number of sampled probabilistic text embeddings.")
+    parser.add_argument("--token_interaction_mode", type=str, default="weighted", choices=["weighted", "unweighted"],
+                        help="Token-level text-video interaction mode for UATVR.")
     parser.add_argument("--uatvr_use_dsl", action='store_true', help="Apply dual softmax in evaluation.")
     parser.add_argument("--uatvr_dsl_mode", type=str, default="col", choices=["col", "bidir"],
                         help="Dual softmax mode: column-only reweighting or bidirectional reweighting.")
@@ -98,7 +102,7 @@ def get_args(description='CLCL on Retrieval Task'):
     ##########  Learning paras  ##########
     parser.add_argument('--lr', type=float, default=0.00001, help='initial learning rate')
     parser.add_argument('--sign_lr', type=float, default=0.0001, help='initial learning rate')
-    parser.add_argument('--optimizer', type=str, default='bertadam', choices=['bertadam', 'adam'], help='optimizer type')
+    parser.add_argument('--optimizer', type=str, default='bertadam', choices=['bertadam', 'adam', 'adamw'], help='optimizer type')
     parser.add_argument('--epochs', type=int, default=200, help='upper epoch limit')
     parser.add_argument('--stop_epochs', type=int, default=210, help='upper epoch limit')
     parser.add_argument('--batch_size', type=int, default=512, help='batch size')
@@ -381,6 +385,24 @@ def prep_optimizer(args, model, num_train_optimization_steps, device, n_gpu, loc
             betas=(0.9, 0.98),
             eps=1e-6,
         )
+    elif args.optimizer == "adamw":
+        optimizer = optim.AdamW(
+            optimizer_grouped_parameters,
+            lr=args.sign_lr,
+            betas=(0.9, 0.98),
+            eps=1e-6,
+        )
+
+        def lr_lambda(current_step):
+            if num_train_optimization_steps <= 0:
+                return 1.0
+            warmup_steps = max(1, int(args.warmup_proportion * num_train_optimization_steps))
+            if current_step < warmup_steps:
+                return float(current_step + 1) / float(warmup_steps)
+            progress = float(current_step - warmup_steps) / float(max(1, num_train_optimization_steps - warmup_steps))
+            return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+        scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
     else:
         optimizer = BertAdam(optimizer_grouped_parameters, lr=args.sign_lr, warmup=args.warmup_proportion,
                              schedule='warmup_cosine', b1=0.9, b2=0.98, e=1e-6,
@@ -482,7 +504,7 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
         input_mask = sample['pairs_mask']
         segment_ids = sample['pairs_segment']
 
-        loss, loss_tv, loss_tp, loss_vp, loss_tf = model(input_ids, segment_ids, input_mask, right_batch, left_batch, body_batch)
+        loss, loss_tv, loss_tp, loss_vp, loss_tf, loss_mean_nce = model(input_ids, segment_ids, input_mask, right_batch, left_batch, body_batch)
 
         if args.debug == True:
             print("forward allocated:")
@@ -520,15 +542,16 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
             global_step += 1
             if global_step % log_step == 0 and local_rank == 0:
                 if args.sim_header == "Filip" and not args.use_pose:
-                    logger.info("Epoch:%d/%s, Step:%d/%d, Loss:%f, Loss_tv:%f, Loss_fg:%f, T/S:%.3f", epoch + 1,
+                    logger.info("Epoch:%d/%s, Step:%d/%d, Loss:%f, Loss_tv:%f, Loss_fg:%f, Loss_mean_nce:%f, T/S:%.3f", epoch + 1,
                                 args.epochs, step + 1,
                                 len(train_dataloader),
                                 float(loss),
                                 float(loss_tv),
                                 float(loss_tf),
+                                float(loss_mean_nce),
                                 (time.time() - start_time) / (log_step * args.gradient_accumulation_steps))
                 else:
-                    logger.info("Epoch:%d/%s, Step:%d/%d, Loss:%f, Loss_tv:%f, Loss_tp:%f, Loss_vp:%f, Loss_tf:%f, T/S:%.3f", epoch + 1,
+                    logger.info("Epoch:%d/%s, Step:%d/%d, Loss:%f, Loss_tv:%f, Loss_tp:%f, Loss_vp:%f, Loss_tf:%f, Loss_mean_nce:%f, T/S:%.3f", epoch + 1,
                                 args.epochs, step + 1,
                                 len(train_dataloader),
                                 float(loss),
@@ -536,12 +559,14 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
                                 float(loss_tp),
                                 float(loss_vp),
                                 float(loss_tf),
+                                float(loss_mean_nce),
                                 (time.time() - start_time) / (log_step * args.gradient_accumulation_steps))
                 metrics = {
                     "train/epoch": epoch + 1,
                     "train/global_step": global_step,
                     "train/loss": float(loss),
                     "train/loss_tv": float(loss_tv),
+                    "train/loss_mean_nce": float(loss_mean_nce),
                     "train/time_per_step": (time.time() - start_time) / (log_step * args.gradient_accumulation_steps),
                 }
                 if args.sim_header == "Filip" and not args.use_pose:
@@ -704,6 +729,13 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu,istrain):
             sim_matrix_tp = np.concatenate(tuple(sim_matrix_tp), axis=0)
             sim_matrix_tf = np.concatenate(tuple(sim_matrix_tf), axis=0)
 
+        # H2S builds similarity in text-major order [num_text, num_video].
+        # Upstream SEDS multi-sentence evaluation expects video-major order [num_video, num_text].
+        sim_matrix_tv = sim_matrix_tv.T
+        if args.use_pose:
+            sim_matrix_tp = sim_matrix_tp.T
+            sim_matrix_tf = sim_matrix_tf.T
+
         if args.uatvr_use_dsl:
             logger.info("Applying dual softmax during evaluation. mode=%s", args.uatvr_dsl_mode)
 
@@ -738,20 +770,19 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu,istrain):
         sim_matrix_new_tf = []
 
         for s_, e_ in zip([0] + cut_off_points2len_[:-1], cut_off_points2len_):
-            group_length = e_ - s_
-            sim_matrix_new_tv.append(np.concatenate((sim_matrix_tv[:, s_:e_],
-                                                  np.full((sim_matrix_tv.shape[0], max_length - group_length), -np.inf)), axis=1))
+            sim_matrix_new_tv.append(np.concatenate((sim_matrix_tv[s_:e_],
+                                                  np.full((max_length - e_ + s_, sim_matrix_tv.shape[1]), -np.inf)), axis=0))
             if args.use_pose:
-                sim_matrix_new_tp.append(np.concatenate((sim_matrix_tp[:, s_:e_],
-                                                      np.full((sim_matrix_tp.shape[0], max_length - group_length), -np.inf)), axis=1))
-                sim_matrix_new_tf.append(np.concatenate((sim_matrix_tf[:, s_:e_],
-                                                      np.full((sim_matrix_tf.shape[0], max_length - group_length), -np.inf)), axis=1))
+                sim_matrix_new_tp.append(np.concatenate((sim_matrix_tp[s_:e_],
+                                                      np.full((max_length - e_ + s_, sim_matrix_tp.shape[1]), -np.inf)), axis=0))
+                sim_matrix_new_tf.append(np.concatenate((sim_matrix_tf[s_:e_],
+                                                      np.full((max_length - e_ + s_, sim_matrix_tf.shape[1]), -np.inf)), axis=0))
 
-        # shape: [num_text, num_groups, max_length]
-        sim_matrix_tv = np.stack(tuple(sim_matrix_new_tv), axis=1)
+        # shape follows upstream SEDS after converting to video-major order: [num_groups, max_length, num_text]
+        sim_matrix_tv = np.stack(tuple(sim_matrix_new_tv), axis=0)
         if args.use_pose:
-            sim_matrix_tp = np.stack(tuple(sim_matrix_new_tp), axis=1)
-            sim_matrix_tf = np.stack(tuple(sim_matrix_new_tf), axis=1)
+            sim_matrix_tp = np.stack(tuple(sim_matrix_new_tp), axis=0)
+            sim_matrix_tf = np.stack(tuple(sim_matrix_new_tf), axis=0)
 
         if args.do_eval:
             logger.info(f"after reshape, sim matrix save to {args.output_dir}")
@@ -766,7 +797,7 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu,istrain):
         if args.use_pose:
             # ---- text-fusion (video+pose fused) ----
             t2v_metrics_tf = tensor_text_to_video_metrics(sim_matrix_tf)
-            v2t_metrics_tf = tensor_video_to_text_metrics(sim_matrix_tf)
+            v2t_metrics_tf = compute_metrics(tensor_video_to_text_sim(sim_matrix_tf))
             logger.info("Fusion_Text-to-Video:")
             logger.info('\t>>>  R@1: {:.1f} - R@5: {:.1f} - R@10: {:.1f} - Median R: {:.1f} - Mean R: {:.1f}'.
                         format(t2v_metrics_tf['R1'], t2v_metrics_tf['R5'], t2v_metrics_tf['R10'], t2v_metrics_tf['MR'], t2v_metrics_tf['MeanR']))
@@ -776,7 +807,7 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu,istrain):
 
         # ---- text-video ----
         t2v_metrics_tv = tensor_text_to_video_metrics(sim_matrix_tv)
-        v2t_metrics_tv = tensor_video_to_text_metrics(sim_matrix_tv)
+        v2t_metrics_tv = compute_metrics(tensor_video_to_text_sim(sim_matrix_tv))
         logger.info("Video_Text-to-Video:")
         logger.info('\t>>>  R@1: {:.1f} - R@5: {:.1f} - R@10: {:.1f} - Median R: {:.1f} - Mean R: {:.1f}'.
                     format(t2v_metrics_tv['R1'], t2v_metrics_tv['R5'], t2v_metrics_tv['R10'], t2v_metrics_tv['MR'], t2v_metrics_tv['MeanR']))
@@ -787,7 +818,7 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu,istrain):
         if args.use_pose:
             # ---- text-pose ----
             t2v_metrics_tp = tensor_text_to_video_metrics(sim_matrix_tp)
-            v2t_metrics_tp = tensor_video_to_text_metrics(sim_matrix_tp)
+            v2t_metrics_tp = compute_metrics(tensor_video_to_text_sim(sim_matrix_tp))
             logger.info("Pose_Text-to-Pose:")
             logger.info('\t>>>  R@1: {:.1f} - R@5: {:.1f} - R@10: {:.1f} - Median R: {:.1f} - Mean R: {:.1f}'.
                         format(t2v_metrics_tp['R1'], t2v_metrics_tp['R5'], t2v_metrics_tp['R10'], t2v_metrics_tp['MR'], t2v_metrics_tp['MeanR']))
