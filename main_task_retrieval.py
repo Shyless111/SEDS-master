@@ -25,9 +25,16 @@ import time
 from util import parallel_apply, get_logger
 from dataloaders.data_dataloaders import DATALOADER_DICT
 global logger
+global swanlab_run
+swanlab_run = None
 from nltk import data
 data.path.append(r"/aiarena/gpfs/jlt/nltk_data/")
 data.path.append(r"/data/jlt/jlt_signtvr_mm_2024/nltk_data/")
+
+try:
+    import swanlab
+except ImportError:
+    swanlab = None
 
 
 import resource
@@ -206,6 +213,9 @@ def get_args(description='CLCL on Retrieval Task'):
 
     parser.add_argument("--pretrained_clip_name", default="ViT-B/32", type=str, help="Choose a CLIP version")
     parser.add_argument("--text_encoder_path", default="", type=str, help="Optional local Hugging Face text encoder path.")
+    parser.add_argument("--use_swanlab", action='store_true', help="Enable SwanLab experiment tracking on rank 0.")
+    parser.add_argument("--swanlab_project", default="SEDS", type=str, help="SwanLab project name.")
+    parser.add_argument("--swanlab_experiment_name", default="", type=str, help="Optional SwanLab experiment name.")
 
     args = parser.parse_args()
 
@@ -261,6 +271,45 @@ def set_seed_logger(args):
             logger.info("  <<< {}: {}".format(key, args.__dict__[key]))
 
     return args
+
+def _to_serializable_config(args):
+    config = {}
+    for key, value in sorted(args.__dict__.items()):
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            config[key] = value
+        elif isinstance(value, (list, tuple)):
+            config[key] = list(value)
+        else:
+            config[key] = str(value)
+    return config
+
+def init_swanlab_run(args):
+    global swanlab_run
+    if not args.use_swanlab or args.local_rank != 0:
+        return None
+    if swanlab is None:
+        raise ImportError("SwanLab is not installed. Please install `swanlab` before enabling --use_swanlab.")
+
+    experiment_name = args.swanlab_experiment_name or os.path.basename(args.output_dir.rstrip("/"))
+    swanlab_run = swanlab.init(
+        project=args.swanlab_project,
+        experiment_name=experiment_name,
+        config=_to_serializable_config(args),
+    )
+    logger.info("SwanLab initialized: project=%s, experiment_name=%s", args.swanlab_project, experiment_name)
+    return swanlab_run
+
+def swanlab_log(metrics, step=None):
+    if swanlab_run is None:
+        return
+    if step is None:
+        swanlab.log(metrics)
+    else:
+        swanlab.log(metrics, step=step)
+
+def finish_swanlab_run():
+    if swanlab_run is not None and hasattr(swanlab_run, "finish"):
+        swanlab_run.finish()
 
 def init_device(args, local_rank):
     global logger
@@ -488,6 +537,20 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
                                 float(loss_vp),
                                 float(loss_tf),
                                 (time.time() - start_time) / (log_step * args.gradient_accumulation_steps))
+                metrics = {
+                    "train/epoch": epoch + 1,
+                    "train/global_step": global_step,
+                    "train/loss": float(loss),
+                    "train/loss_tv": float(loss_tv),
+                    "train/time_per_step": (time.time() - start_time) / (log_step * args.gradient_accumulation_steps),
+                }
+                if args.sim_header == "Filip" and not args.use_pose:
+                    metrics["train/loss_fg"] = float(loss_tf)
+                else:
+                    metrics["train/loss_tp"] = float(loss_tp)
+                    metrics["train/loss_vp"] = float(loss_vp)
+                    metrics["train/loss_tf"] = float(loss_tf)
+                swanlab_log(metrics, step=global_step)
                 start_time = time.time()
 
     total_loss = total_loss / len(train_dataloader)
@@ -732,17 +795,28 @@ def eval_epoch(args, model, test_dataloader, device, n_gpu,istrain):
             logger.info('\t>>>  R@1: {:.1f} - R@5: {:.1f} - R@10: {:.1f} - Median R: {:.1f} - Mean R: {:.1f}'.
                         format(v2t_metrics_tp['R1'], v2t_metrics_tp['R5'], v2t_metrics_tp['R10'], v2t_metrics_tp['MR'], v2t_metrics_tp['MeanR']))
 
-    R1 = t2v_metrics_tf['R1'] if args.use_pose else t2v_metrics_tv['R1']
+    selected_r1 = t2v_metrics_tf['R1'] if args.use_pose else t2v_metrics_tv['R1']
 
     end_time = time.time() 
     print("操作耗时：", (end_time - start_time)*1000, "毫秒")
     torch.cuda.empty_cache()
-    return R1
+    result = {
+        "selected_r1": selected_r1,
+        "video_t2v": t2v_metrics_tv,
+        "video_v2t": v2t_metrics_tv,
+    }
+    if args.use_pose:
+        result["fusion_t2v"] = t2v_metrics_tf
+        result["fusion_v2t"] = v2t_metrics_tf
+        result["pose_t2v"] = t2v_metrics_tp
+        result["pose_v2t"] = v2t_metrics_tp
+    return result
 
 def main():
     global logger
     args = get_args()
     args = set_seed_logger(args)
+    init_swanlab_run(args)
     device, n_gpu = init_device(args, args.local_rank)
 
     if args.text_encoder_path:
@@ -815,7 +889,8 @@ def main():
                 output_model_file = save_model(epoch, args, model, optimizer, tr_loss, type_name="")
 
             if args.local_rank == 0:
-                R1 = eval_epoch(args, model, test_dataloader, device, n_gpu,False)
+                eval_result = eval_epoch(args, model, test_dataloader, device, n_gpu,False)
+                R1 = eval_result["selected_r1"]
                 if best_score <= R1:
                     best_score = R1
                     best_epoch=epoch
@@ -825,6 +900,32 @@ def main():
                 acc_record.append(R1)
                 logger.info(loss_record)
                 logger.info(acc_record)
+                swanlab_eval_metrics = {
+                    "eval/epoch": epoch + 1,
+                    "eval/best_r1": best_score,
+                    "eval/video_t2v_R1": eval_result["video_t2v"]["R1"],
+                    "eval/video_t2v_R5": eval_result["video_t2v"]["R5"],
+                    "eval/video_t2v_R10": eval_result["video_t2v"]["R10"],
+                    "eval/video_v2t_R1": eval_result["video_v2t"]["R1"],
+                    "eval/video_v2t_R5": eval_result["video_v2t"]["R5"],
+                    "eval/video_v2t_R10": eval_result["video_v2t"]["R10"],
+                }
+                if args.use_pose:
+                    swanlab_eval_metrics.update({
+                        "eval/fusion_t2v_R1": eval_result["fusion_t2v"]["R1"],
+                        "eval/fusion_t2v_R5": eval_result["fusion_t2v"]["R5"],
+                        "eval/fusion_t2v_R10": eval_result["fusion_t2v"]["R10"],
+                        "eval/fusion_v2t_R1": eval_result["fusion_v2t"]["R1"],
+                        "eval/fusion_v2t_R5": eval_result["fusion_v2t"]["R5"],
+                        "eval/fusion_v2t_R10": eval_result["fusion_v2t"]["R10"],
+                        "eval/pose_t2v_R1": eval_result["pose_t2v"]["R1"],
+                        "eval/pose_t2v_R5": eval_result["pose_t2v"]["R5"],
+                        "eval/pose_t2v_R10": eval_result["pose_t2v"]["R10"],
+                        "eval/pose_v2t_R1": eval_result["pose_v2t"]["R1"],
+                        "eval/pose_v2t_R5": eval_result["pose_v2t"]["R5"],
+                        "eval/pose_v2t_R10": eval_result["pose_v2t"]["R10"],
+                    })
+                swanlab_log(swanlab_eval_metrics, step=epoch + 1)
 
                 if epoch == args.stop_epochs:
                     break
@@ -834,4 +935,7 @@ def main():
             eval_epoch(args, model, test_dataloader, device, n_gpu,False)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        finish_swanlab_run()

@@ -10,6 +10,7 @@ BATCH_SIZE_VAL="${BATCH_SIZE_VAL:-64}"
 MASTER_PORT="${MASTER_PORT:-29668}"
 RUN_TAG="${RUN_TAG:-default}"
 TEXT_ENCODER_PATH="${TEXT_ENCODER_PATH:-/sda/home/shihaoyu/Projects/MESM/distilbert-base-uncased}"
+USE_CLIP_TEXT_ENCODER="${USE_CLIP_TEXT_ENCODER:-0}"
 USE_UATVR_HEAD="${USE_UATVR_HEAD:-0}"
 UATVR_USE_DSL="${UATVR_USE_DSL:-0}"
 UATVR_DSL_MODE="${UATVR_DSL_MODE:-col}"
@@ -18,6 +19,9 @@ UATVR_KL_WEIGHT="${UATVR_KL_WEIGHT:-1e-4}"
 N_VIDEO_EMBEDDINGS="${N_VIDEO_EMBEDDINGS:-7}"
 N_TEXT_EMBEDDINGS="${N_TEXT_EMBEDDINGS:-7}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
+USE_SWANLAB="${USE_SWANLAB:-0}"
+SWANLAB_PROJECT="${SWANLAB_PROJECT:-SEDS}"
+SWANLAB_EXPERIMENT_NAME="${SWANLAB_EXPERIMENT_NAME:-}"
 OUTPUT_DIR="result_train/h2s_bs${BATCH_SIZE}_${RUN_TAG}_${TIME_NOW}"
 
 CMD=(python -m torch.distributed.launch --nproc_per_node="${NPROC_PER_NODE}" --master_port "${MASTER_PORT}" \
@@ -34,8 +38,11 @@ main_task_retrieval.py --do_train --num_thread_reader="${NUM_WORKERS}" \
 --batch_size_val "${BATCH_SIZE_VAL}" \
 --datatype h2s_pose --coef_lr 1. --freeze_layer_num 0 \
 --linear_patch 2d --sim_header Filip --filip_only \
---text_encoder_path "${TEXT_ENCODER_PATH}" \
 --pretrained_clip_name ViT-B/32)
+
+if [ "${USE_CLIP_TEXT_ENCODER}" != "1" ]; then
+  CMD+=(--text_encoder_path "${TEXT_ENCODER_PATH}")
+fi
 
 if [ "${USE_UATVR_HEAD}" = "1" ]; then
   CMD+=(--use_uatvr_head \
@@ -53,6 +60,13 @@ if [ -n "${EXTRA_ARGS}" ]; then
   # shellcheck disable=SC2206
   EXTRA_ARGS_ARRAY=(${EXTRA_ARGS})
   CMD+=("${EXTRA_ARGS_ARRAY[@]}")
+fi
+
+if [ "${USE_SWANLAB}" = "1" ]; then
+  CMD+=(--use_swanlab --swanlab_project "${SWANLAB_PROJECT}")
+  if [ -n "${SWANLAB_EXPERIMENT_NAME}" ]; then
+    CMD+=(--swanlab_experiment_name "${SWANLAB_EXPERIMENT_NAME}")
+  fi
 fi
 
 CUDA_VISIBLE_DEVICES="${GPU_IDS}" "${CMD[@]}"
