@@ -11,6 +11,8 @@ MASTER_PORT="${MASTER_PORT:-29668}"
 RUN_TAG="${RUN_TAG:-default}"
 TEXT_ENCODER_PATH="${TEXT_ENCODER_PATH:-/sda/home/shihaoyu/Projects/MESM/distilbert-base-uncased}"
 USE_CLIP_TEXT_ENCODER="${USE_CLIP_TEXT_ENCODER:-0}"
+USE_ROBERTA_TEXT_ENCODER="${USE_ROBERTA_TEXT_ENCODER:-0}"
+ROBERTA_TEXT_ENCODER_PATH="${ROBERTA_TEXT_ENCODER_PATH:-/sda/home/shihaoyu/Projects/SEDS-master/pretrained_models/roberta-base}"
 USE_UATVR_HEAD="${USE_UATVR_HEAD:-0}"
 UATVR_USE_DSL="${UATVR_USE_DSL:-0}"
 UATVR_DSL_MODE="${UATVR_DSL_MODE:-col}"
@@ -46,6 +48,10 @@ main_task_retrieval.py --do_train --num_thread_reader="${NUM_WORKERS}" \
 
 if [ "${USE_CLIP_TEXT_ENCODER}" != "1" ]; then
   CMD+=(--text_encoder_path "${TEXT_ENCODER_PATH}")
+fi
+
+if [ "${USE_ROBERTA_TEXT_ENCODER}" = "1" ]; then
+  CMD+=(--use_roberta_text_encoder --roberta_text_encoder_path "${ROBERTA_TEXT_ENCODER_PATH}")
 fi
 
 if [ "${USE_UATVR_HEAD}" = "1" ]; then

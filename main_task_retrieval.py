@@ -217,6 +217,12 @@ def get_args(description='CLCL on Retrieval Task'):
 
     parser.add_argument("--pretrained_clip_name", default="ViT-B/32", type=str, help="Choose a CLIP version")
     parser.add_argument("--text_encoder_path", default="", type=str, help="Optional local Hugging Face text encoder path.")
+    parser.add_argument("--use_roberta_text_encoder", action='store_true',
+                        help="Use a local RoBERTa text encoder path instead of the default Hugging Face text encoder path.")
+    parser.add_argument("--roberta_text_encoder_path",
+                        default="/sda/home/shihaoyu/Projects/SEDS-master/pretrained_models/roberta-base",
+                        type=str,
+                        help="Local RoBERTa text encoder path used when --use_roberta_text_encoder is enabled.")
     parser.add_argument("--use_swanlab", action='store_true', help="Enable SwanLab experiment tracking on rank 0.")
     parser.add_argument("--swanlab_project", default="SEDS", type=str, help="SwanLab project name.")
     parser.add_argument("--swanlab_experiment_name", default="", type=str, help="Optional SwanLab experiment name.")
@@ -226,6 +232,9 @@ def get_args(description='CLCL on Retrieval Task'):
 
     if args.sim_header == "tightTransf":
         args.loose_type = False
+
+    if args.use_roberta_text_encoder:
+        args.text_encoder_path = args.roberta_text_encoder_path
 
     # Check paramenters
     if args.gradient_accumulation_steps < 1:
