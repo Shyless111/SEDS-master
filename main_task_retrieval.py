@@ -71,6 +71,18 @@ def get_args(description='CLCL on Retrieval Task'):
     parser.add_argument("--filip_retrieval_weight", default=0.5, type=float, help="Weight for FILIP fine-grained similarity during retrieval.")
     parser.add_argument("--filip_chunk_size", default=32, type=int, help="Chunk size for FILIP pairwise token similarity.")
     parser.add_argument("--filip_only", action='store_true', help="Use only FILIP fine-grained similarity for training loss and retrieval.")
+    parser.add_argument("--similarity_plugin", default="base", type=str, choices=["base", "multilevel"],
+                        help="Optional similarity plugin. `base` keeps current behavior unchanged.")
+    parser.add_argument("--sim_token_weight", default=1.0, type=float,
+                        help="Fusion weight for token-level similarity in the multilevel plugin.")
+    parser.add_argument("--sim_distribution_weight", default=0.0, type=float,
+                        help="Fusion weight for distribution-level similarity in the multilevel plugin.")
+    parser.add_argument("--sim_global_weight", default=0.0, type=float,
+                        help="Fusion weight for global-level similarity in the multilevel plugin.")
+    parser.add_argument("--sim_fusion_norm", default="zscore", type=str, choices=["none", "zscore"],
+                        help="Normalization mode before fusing similarity branches in the multilevel plugin.")
+    parser.add_argument("--sim_distribution_tau", default=1.0, type=float,
+                        help="Temperature/divisor for the distribution-level similarity in the multilevel plugin.")
     parser.add_argument("--mean_nce_weight", default=0.0, type=float, help="Deprecated alias for global alignment weight. Kept for backward compatibility.")
     parser.add_argument("--global_align_weight", default=None, type=float, help="Weight for mean pooled text-video global alignment InfoNCE loss.")
     parser.add_argument("--use_uatvr_head", action='store_true', help="Enable UATVR probabilistic retrieval head.")

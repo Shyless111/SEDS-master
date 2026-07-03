@@ -17,6 +17,7 @@ import  torch.nn.functional as F
 from modules.module_clip import CLIP, CLIP_vision, convert_weights
 from torch.nn.utils.rnn import pad_packed_sequence, pack_padded_sequence
 from modules.modeling_signbert import init_sign_model
+from modules.similarity_plugins import build_similarity_plugin
 from prob_models.pie_model import PIENet
 from prob_models.uncertainty_module import UncertaintyModuleImage
 from prob_models.tensor_utils import l2_normalize, sample_gaussian_tensors
@@ -107,6 +108,13 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
         self.use_uatvr_head = getattr(task_config, "use_uatvr_head", False)
         self.use_filip = getattr(task_config, "sim_header", "meanP") == "Filip"
         self.signbert_have = task_config.signbert
+        self.similarity_plugin = build_similarity_plugin(task_config)
+        self.use_similarity_plugin = self.similarity_plugin is not None
+        if self.use_similarity_plugin:
+            show_log(task_config, "\t similarity_plugin: {}".format(getattr(task_config, "similarity_plugin", "base")))
+            show_log(task_config, "\t sim_token_weight: {}".format(getattr(task_config, "sim_token_weight", 1.0)))
+            show_log(task_config, "\t sim_distribution_weight: {}".format(getattr(task_config, "sim_distribution_weight", 0.0)))
+            show_log(task_config, "\t sim_global_weight: {}".format(getattr(task_config, "sim_global_weight", 0.0)))
         self.fusion_type = task_config.fusion_type
         self.freeze_exfusion = task_config.freeze_exfusion
         self.dual_mix = task_config.dual_mix
@@ -280,14 +288,24 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
         return (hidden * mask).sum(dim=1) / denom
 
     def _compute_global_alignment_loss(self, text_hidden, text_valid_mask, video_hidden, video_valid_mask, logit_scale):
+        sim_mean = self._compute_global_similarity_matrix(
+            text_hidden, text_valid_mask, video_hidden, video_valid_mask, logit_scale
+        )
+        return (self.loss_fct(sim_mean) + self.loss_fct(sim_mean.t())) / 2
+
+    def _compute_global_similarity_matrix(self, text_hidden, text_valid_mask, video_hidden, video_valid_mask, logit_scale):
         text_pooled = self._masked_mean_pooling(text_hidden, text_valid_mask)
         video_pooled = self._masked_mean_pooling(video_hidden, video_valid_mask)
 
         text_pooled = text_pooled / text_pooled.norm(dim=-1, keepdim=True).clamp_min(1e-6)
         video_pooled = video_pooled / video_pooled.norm(dim=-1, keepdim=True).clamp_min(1e-6)
 
-        sim_mean = logit_scale * text_pooled @ video_pooled.t()
-        return (self.loss_fct(sim_mean) + self.loss_fct(sim_mean.t())) / 2
+        return logit_scale * text_pooled @ video_pooled.t()
+
+    def _compute_global_logits_from_global(self, text_global, video_global, logit_scale):
+        t = text_global / text_global.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        v = video_global / video_global.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        return logit_scale * t @ v.t()
 
     def _compute_mean_nce_loss(self, text_hidden, text_valid_mask, video_hidden, video_valid_mask, logit_scale):
         return self._compute_global_alignment_loss(
@@ -500,7 +518,7 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
             if self.use_pose:
                 pose_global = allgather(pose_global.contiguous(), self.task_config)
             video_global = allgather(video_global.contiguous(), self.task_config)
-            if (self.use_filip or self.use_uatvr_head or self.use_mean_nce) and text_hidden is not None:
+            if (self.use_filip or self.use_uatvr_head or self.use_mean_nce or self.use_similarity_plugin) and text_hidden is not None:
                 text_hidden = allgather(text_hidden.contiguous(), self.task_config)
                 text_valid_mask = allgather(text_valid_mask.float(), self.task_config).bool()
                 video_hidden = allgather(video_hidden.contiguous(), self.task_config)
@@ -508,6 +526,15 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
             torch.distributed.barrier()
 
         logit_scale = self.clip.logit_scale.exp()
+        if self.use_similarity_plugin and text_hidden is not None and video_hidden is not None and not self.use_pose:
+            total_loss, plugin_details = self.similarity_plugin.compute_training_loss(
+                self, text_global, video_global, text_hidden, text_valid_mask, video_hidden, video_valid_mask, logit_scale
+            )
+            loss_tv = plugin_details["retrieval_loss"]
+            aux_loss = plugin_details["aux_loss"]
+            zero = loss_tv.detach().new_zeros(())
+            return total_loss, loss_tv, zero, zero, aux_loss, zero
+
         zero = text_global.detach().new_zeros(())
         loss_global = zero
         if self.use_global_align and text_hidden is not None and video_hidden is not None:
@@ -574,7 +601,7 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
             attention_mask = attention_mask.view(-1, attention_mask.shape[-1])
 
         if self.use_hf_text_encoder:
-            if get_hidden and (self.use_filip or self.use_uatvr_head or self.use_global_align):
+            if get_hidden and (self.use_filip or self.use_uatvr_head or self.use_global_align or self.use_similarity_plugin):
                 text_global, text_hidden = self._encode_text_with_hf(input_ids, attention_mask, return_hidden=True)
                 return {
                     "global": text_global,
@@ -585,7 +612,7 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
             text_global = self._encode_text_with_hf(input_ids, attention_mask, return_hidden=False)
             return {"global": text_global}
 
-        if get_hidden and (self.use_filip or self.use_uatvr_head or self.use_global_align):
+        if get_hidden and (self.use_filip or self.use_uatvr_head or self.use_global_align or self.use_similarity_plugin):
             _, text_hidden = self.clip.encode_text(input_ids, return_hidden=True)
             text_hidden = text_hidden.float()
             text_global = text_hidden[torch.arange(text_hidden.shape[0]), input_ids.argmax(dim=-1)]
@@ -652,7 +679,7 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
         pose_global = None
         if self.use_pose:
             pose_global = self.clip.encode_image(video_pose, return_hidden=False, video_mask=video_mask, video_frame=video_frame).float()  # B, 512
-        if get_hidden and (self.use_filip or self.use_uatvr_head or self.use_global_align):
+        if get_hidden and (self.use_filip or self.use_uatvr_head or self.use_global_align or self.use_similarity_plugin):
             _, video_hidden = self.clip_rgb.encode_image(video_rgb, return_hidden=True, video_mask=video_mask, video_frame=video_frame)
             video_hidden = video_hidden.float()
             video_global = video_hidden[:, 0, :]
@@ -687,7 +714,11 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
     def get_global_similarity(self, text_global, pose_global, video_global, text_hidden=None, text_valid_mask=None, video_hidden=None, video_valid_mask=None):
         logit_scale = self.clip.logit_scale.exp()
         t = text_global / text_global.norm(dim=-1, keepdim=True)
-        if self.use_uatvr_head and text_hidden is not None and video_hidden is not None:
+        if self.use_similarity_plugin and text_hidden is not None and video_hidden is not None and not self.use_pose:
+            sim_tv = self.similarity_plugin.compute_inference_similarity(
+                self, text_global, video_global, text_hidden, text_valid_mask, video_hidden, video_valid_mask, logit_scale
+            )
+        elif self.use_uatvr_head and text_hidden is not None and video_hidden is not None:
             sim_tv, _, _ = self.compute_uatvr_losses(
                 text_hidden, text_valid_mask, video_hidden, video_valid_mask, logit_scale
             )
