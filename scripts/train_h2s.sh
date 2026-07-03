@@ -22,6 +22,7 @@ N_VIDEO_EMBEDDINGS="${N_VIDEO_EMBEDDINGS:-7}"
 N_TEXT_EMBEDDINGS="${N_TEXT_EMBEDDINGS:-7}"
 OPTIMIZER="${OPTIMIZER:-bertadam}"
 MEAN_NCE_WEIGHT="${MEAN_NCE_WEIGHT:-0}"
+GLOBAL_ALIGN_WEIGHT="${GLOBAL_ALIGN_WEIGHT:-}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 USE_SWANLAB="${USE_SWANLAB:-1}"
 SWANLAB_PROJECT="${SWANLAB_PROJECT:-SEDS}"
@@ -60,6 +61,10 @@ if [ "${USE_UATVR_HEAD}" = "1" ]; then
   --uatvr_kl_weight "${UATVR_KL_WEIGHT}" \
   --n_video_embeddings "${N_VIDEO_EMBEDDINGS}" \
   --n_text_embeddings "${N_TEXT_EMBEDDINGS}")
+fi
+
+if [ -n "${GLOBAL_ALIGN_WEIGHT}" ]; then
+  CMD+=(--global_align_weight "${GLOBAL_ALIGN_WEIGHT}")
 fi
 
 if [ "${UATVR_USE_DSL}" = "1" ]; then

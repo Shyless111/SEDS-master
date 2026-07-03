@@ -71,7 +71,8 @@ def get_args(description='CLCL on Retrieval Task'):
     parser.add_argument("--filip_retrieval_weight", default=0.5, type=float, help="Weight for FILIP fine-grained similarity during retrieval.")
     parser.add_argument("--filip_chunk_size", default=32, type=int, help="Chunk size for FILIP pairwise token similarity.")
     parser.add_argument("--filip_only", action='store_true', help="Use only FILIP fine-grained similarity for training loss and retrieval.")
-    parser.add_argument("--mean_nce_weight", default=0.0, type=float, help="Weight for mean pooled text-video InfoNCE loss.")
+    parser.add_argument("--mean_nce_weight", default=0.0, type=float, help="Deprecated alias for global alignment weight. Kept for backward compatibility.")
+    parser.add_argument("--global_align_weight", default=None, type=float, help="Weight for mean pooled text-video global alignment InfoNCE loss.")
     parser.add_argument("--use_uatvr_head", action='store_true', help="Enable UATVR probabilistic retrieval head.")
     parser.add_argument("--uatvr_mil_weight", default=1e-2, type=float, help="Weight for UATVR MIL loss.")
     parser.add_argument("--uatvr_kl_weight", default=1e-4, type=float, help="Weight for UATVR KL loss.")
@@ -513,7 +514,7 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
         input_mask = sample['pairs_mask']
         segment_ids = sample['pairs_segment']
 
-        loss, loss_tv, loss_tp, loss_vp, loss_tf, loss_mean_nce = model(input_ids, segment_ids, input_mask, right_batch, left_batch, body_batch)
+        loss, loss_tv, loss_tp, loss_vp, loss_tf, loss_global = model(input_ids, segment_ids, input_mask, right_batch, left_batch, body_batch)
 
         if args.debug == True:
             print("forward allocated:")
@@ -551,16 +552,16 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
             global_step += 1
             if global_step % log_step == 0 and local_rank == 0:
                 if args.sim_header == "Filip" and not args.use_pose:
-                    logger.info("Epoch:%d/%s, Step:%d/%d, Loss:%f, Loss_tv:%f, Loss_fg:%f, Loss_mean_nce:%f, T/S:%.3f", epoch + 1,
+                    logger.info("Epoch:%d/%s, Step:%d/%d, Loss:%f, Loss_tv:%f, Loss_fg:%f, Loss_global:%f, T/S:%.3f", epoch + 1,
                                 args.epochs, step + 1,
                                 len(train_dataloader),
                                 float(loss),
                                 float(loss_tv),
                                 float(loss_tf),
-                                float(loss_mean_nce),
+                                float(loss_global),
                                 (time.time() - start_time) / (log_step * args.gradient_accumulation_steps))
                 else:
-                    logger.info("Epoch:%d/%s, Step:%d/%d, Loss:%f, Loss_tv:%f, Loss_tp:%f, Loss_vp:%f, Loss_tf:%f, Loss_mean_nce:%f, T/S:%.3f", epoch + 1,
+                    logger.info("Epoch:%d/%s, Step:%d/%d, Loss:%f, Loss_tv:%f, Loss_tp:%f, Loss_vp:%f, Loss_tf:%f, Loss_global:%f, T/S:%.3f", epoch + 1,
                                 args.epochs, step + 1,
                                 len(train_dataloader),
                                 float(loss),
@@ -568,14 +569,14 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
                                 float(loss_tp),
                                 float(loss_vp),
                                 float(loss_tf),
-                                float(loss_mean_nce),
+                                float(loss_global),
                                 (time.time() - start_time) / (log_step * args.gradient_accumulation_steps))
                 metrics = {
                     "train/epoch": epoch + 1,
                     "train/global_step": global_step,
                     "train/loss": float(loss),
                     "train/loss_tv": float(loss_tv),
-                    "train/loss_mean_nce": float(loss_mean_nce),
+                    "train/loss_global": float(loss_global),
                     "train/time_per_step": (time.time() - start_time) / (log_step * args.gradient_accumulation_steps),
                 }
                 if args.sim_header == "Filip" and not args.use_pose:
