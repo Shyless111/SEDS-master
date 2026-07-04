@@ -24,14 +24,14 @@ class AdaptiveMultiLevelSimilarityPlugin(nn.Module, MultiLevelSimilarityPlugin):
             nn.GELU(),
             nn.Linear(hidden_dim, 3),
         )
-        self._inference_sample_cache = {"text": {}, "video": {}}
+        self._inference_distribution_cache = {"text": {}, "video": {}}
 
     @property
     def requires_global_inference_fusion(self):
         return self.fusion_norm == "minmax"
 
     def clear_inference_cache(self):
-        self._inference_sample_cache = {"text": {}, "video": {}}
+        self._inference_distribution_cache = {"text": {}, "video": {}}
 
     def reset_gate_output(self):
         # Equal initial weights let the network learn branch preference instead
@@ -47,33 +47,37 @@ class AdaptiveMultiLevelSimilarityPlugin(nn.Module, MultiLevelSimilarityPlugin):
         return floor + (1.0 - 3.0 * floor) * weights
 
     def _compute_text_weights(self, model, hidden, valid_mask):
-        query = model._masked_mean_pooling(hidden, valid_mask)
+        query = hidden[:, 0] if self.gate_content_pooling == "cls" else model._masked_mean_pooling(hidden, valid_mask)
         return self._query_weights(query)
 
     def _compute_video_weights(self, model, hidden, valid_mask):
-        query = model._masked_mean_pooling(hidden, valid_mask)
+        query = hidden[:, 0] if self.gate_content_pooling == "cls" else model._masked_mean_pooling(hidden, valid_mask)
         return self._query_weights(query)
 
     @staticmethod
     def _cache_key(hidden):
         return (hidden.data_ptr(), tuple(hidden.shape), hidden.device)
 
-    def _cached_distribution_samples(self, model, modality, hidden, valid_mask):
+    def _cached_distribution_output(self, model, modality, hidden, valid_mask):
         key = self._cache_key(hidden)
-        cache = self._inference_sample_cache[modality]
+        cache = self._inference_distribution_cache[modality]
         if key in cache:
             return cache[key]
 
         tokens = F.normalize(hidden, dim=-1)
         pooled = model._masked_mean_pooling(tokens, valid_mask)
         pooled = F.normalize(pooled, dim=-1)
+        sample_embeddings = self.distribution_metric != "wasserstein"
         if modality == "text":
-            output = model.probabilistic_text(pooled, tokens, valid_mask)
+            output = model.probabilistic_text(
+                pooled, tokens, valid_mask, sample_embeddings=sample_embeddings
+            )
         else:
-            output = model.probabilistic_video(pooled, tokens, valid_mask)
-        samples = F.normalize(output["embedding"], dim=-1)
-        cache[key] = samples
-        return samples
+            output = model.probabilistic_video(
+                pooled, tokens, valid_mask, sample_embeddings=sample_embeddings
+            )
+        cache[key] = output
+        return output
 
     def compute_inference_components(self, model, text_global, video_global, text_hidden,
                                      text_valid_mask, video_hidden, video_valid_mask, logit_scale):
@@ -90,23 +94,30 @@ class AdaptiveMultiLevelSimilarityPlugin(nn.Module, MultiLevelSimilarityPlugin):
             )
         token_sim = logit_scale * token_sim
 
-        text_samples = self._cached_distribution_samples(
+        prob_text = self._cached_distribution_output(
             model, "text", text_hidden, text_valid_mask
         )
-        video_samples = self._cached_distribution_samples(
+        prob_video = self._cached_distribution_output(
             model, "video", video_hidden, video_valid_mask
         )
-        batch_text, n_text, dim = text_samples.shape
-        batch_video, n_video, _ = video_samples.shape
-        flat_sim = torch.einsum(
-            "ad,bd->ab",
-            video_samples.reshape(-1, dim),
-            text_samples.reshape(-1, dim),
-        )
-        blocks = flat_sim.view(batch_video, n_video, batch_text, n_text).permute(2, 0, 3, 1)
-        distribution_sim = (
-            logit_scale * blocks.mean(dim=(2, 3)) / max(self.distribution_tau, 1e-6)
-        )
+        if self.distribution_metric == "wasserstein":
+            distribution_sim = model._gaussian_wasserstein_similarity(
+                prob_text, prob_video, logit_scale, self.distribution_tau
+            )
+        else:
+            text_samples = F.normalize(prob_text["embedding"], dim=-1)
+            video_samples = F.normalize(prob_video["embedding"], dim=-1)
+            batch_text, n_text, dim = text_samples.shape
+            batch_video, n_video, _ = video_samples.shape
+            flat_sim = torch.einsum(
+                "ad,bd->ab",
+                video_samples.reshape(-1, dim),
+                text_samples.reshape(-1, dim),
+            )
+            blocks = flat_sim.view(batch_video, n_video, batch_text, n_text).permute(2, 0, 3, 1)
+            distribution_sim = (
+                logit_scale * blocks.mean(dim=(2, 3)) / max(self.distribution_tau, 1e-6)
+            )
         global_sim = self._compute_global_similarity(
             model, text_hidden, text_valid_mask, video_hidden, video_valid_mask, logit_scale
         )
@@ -147,9 +158,10 @@ class AdaptiveMultiLevelSimilarityPlugin(nn.Module, MultiLevelSimilarityPlugin):
         token_sim, mil_loss, kl_loss, distribution_sim, mil_query_losses = model.compute_uatvr_losses(
             text_hidden, text_valid_mask, video_hidden, video_valid_mask,
             logit_scale, return_distribution=True,
-            token_interaction_mode=getattr(model.task_config, "token_interaction_mode", "weighted")
+            token_interaction_mode=getattr(model.task_config, "token_interaction_mode", "weighted"),
+            distribution_metric=self.distribution_metric,
+            distribution_tau=self.distribution_tau,
         )
-        distribution_sim = distribution_sim / max(self.distribution_tau, 1e-6)
         global_sim = self._compute_global_similarity(
             model, text_hidden, text_valid_mask, video_hidden, video_valid_mask, logit_scale
         )

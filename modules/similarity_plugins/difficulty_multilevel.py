@@ -31,7 +31,7 @@ class DifficultyAwareMultiLevelSimilarityPlugin(AdaptiveMultiLevelSimilarityPlug
             nn.init.zeros_(gate[-1].bias)
 
     @staticmethod
-    def _structural_features(hidden, valid_mask):
+    def _structural_features(hidden, valid_mask, content_pooling="mean"):
         mask = valid_mask.to(hidden.dtype).unsqueeze(-1)
         count = mask.sum(dim=1).clamp_min(1.0)
         mean = (hidden * mask).sum(dim=1) / count
@@ -50,9 +50,10 @@ class DifficultyAwareMultiLevelSimilarityPlugin(AdaptiveMultiLevelSimilarityPlug
         change_std = change_var.clamp_min(1e-8).sqrt()
         length_ratio = valid_mask.sum(dim=1).to(hidden.dtype) / max(hidden.size(1), 1)
 
+        content = hidden[:, 0] if content_pooling == "cls" else mean
         return torch.cat(
             [
-                F.normalize(mean, dim=-1),
+                F.normalize(content, dim=-1),
                 std,
                 length_ratio.unsqueeze(-1),
                 change_mean.unsqueeze(-1),
@@ -62,7 +63,9 @@ class DifficultyAwareMultiLevelSimilarityPlugin(AdaptiveMultiLevelSimilarityPlug
         )
 
     def _weights_from_gate(self, gate, hidden, valid_mask):
-        features = self._structural_features(hidden, valid_mask)
+        features = self._structural_features(
+            hidden, valid_mask, content_pooling=self.gate_content_pooling
+        )
         logits = gate(features) / max(self.gate_temperature, 1e-6)
         weights = F.softmax(logits, dim=-1)
         floor = min(max(self.gate_min_weight, 0.0), 1.0 / 3.0)

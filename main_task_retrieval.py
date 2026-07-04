@@ -79,10 +79,21 @@ def get_args(description='CLCL on Retrieval Task'):
                         help="Fusion weight for distribution-level similarity in the multilevel plugin.")
     parser.add_argument("--sim_global_weight", default=0.0, type=float,
                         help="Fusion weight for global-level similarity in the multilevel plugin.")
+    parser.add_argument("--sim_global_pooling", default="mean", type=str, choices=["mean", "cls"],
+                        help="Global semantic summary used by multilevel similarity and query gates.")
+    parser.add_argument("--sim_text_global_pooling", default=None, type=str, choices=["mean", "cls"],
+                        help="Optional text-side override for multilevel global pooling.")
+    parser.add_argument("--sim_video_global_pooling", default=None, type=str, choices=["mean", "cls"],
+                        help="Optional video-side override for multilevel global pooling.")
+    parser.add_argument("--sim_gate_content_pooling", default=None, type=str, choices=["mean", "cls"],
+                        help="Optional content-summary override used by query-adaptive gates.")
     parser.add_argument("--sim_fusion_norm", default="zscore", type=str, choices=["none", "zscore"],
                         help="Normalization mode before fusing similarity branches in the multilevel plugin.")
     parser.add_argument("--sim_distribution_tau", default=1.0, type=float,
                         help="Temperature/divisor for the distribution-level similarity in the multilevel plugin.")
+    parser.add_argument("--sim_distribution_metric", default="sampled_mean", type=str,
+                        choices=["sampled_mean", "wasserstein"],
+                        help="Distribution similarity: sampled embedding mean or diagonal-Gaussian Wasserstein distance.")
     parser.add_argument("--sim_qamf_sigma", default=0.5, type=float,
                         help="Gaussian decay sigma for the query-adaptive late fusion plugin.")
     parser.add_argument("--sim_qamf_eps", default=1e-6, type=float,

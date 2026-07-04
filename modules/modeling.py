@@ -296,9 +296,21 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
         )
         return (self.loss_fct(sim_mean) + self.loss_fct(sim_mean.t())) / 2
 
-    def _compute_global_similarity_matrix(self, text_hidden, text_valid_mask, video_hidden, video_valid_mask, logit_scale):
-        text_pooled = self._masked_mean_pooling(text_hidden, text_valid_mask)
-        video_pooled = self._masked_mean_pooling(video_hidden, video_valid_mask)
+    def _compute_global_similarity_matrix(self, text_hidden, text_valid_mask, video_hidden,
+                                          video_valid_mask, logit_scale, pooling="mean",
+                                          text_pooling=None, video_pooling=None):
+        text_pooling = text_pooling or pooling
+        video_pooling = video_pooling or pooling
+        text_pooled = (
+            text_hidden[:, 0]
+            if text_pooling == "cls"
+            else self._masked_mean_pooling(text_hidden, text_valid_mask)
+        )
+        video_pooled = (
+            video_hidden[:, 0]
+            if video_pooling == "cls"
+            else self._masked_mean_pooling(video_hidden, video_valid_mask)
+        )
 
         text_pooled = text_pooled / text_pooled.norm(dim=-1, keepdim=True).clamp_min(1e-6)
         video_pooled = video_pooled / video_pooled.norm(dim=-1, keepdim=True).clamp_min(1e-6)
@@ -393,7 +405,7 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
         v2t_logits = torch.sum(v2t_logits, dim=2) / video_sum.unsqueeze(0)
         return (t2v_logits + v2t_logits) / 2.0
 
-    def probabilistic_video(self, video_pooled, videos, video_valid_mask):
+    def probabilistic_video(self, video_pooled, videos, video_valid_mask, sample_embeddings=True):
         output = {}
         pad_mask = ~video_valid_mask
         out, attn, residual = self.pie_net_video(video_pooled, videos, pad_mask=pad_mask)
@@ -407,10 +419,11 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
 
         out = l2_normalize(out)
         output["mean"] = out
-        output["embedding"] = sample_gaussian_tensors(out, logsigma, self.n_video_samples)
+        if sample_embeddings:
+            output["embedding"] = sample_gaussian_tensors(out, logsigma, self.n_video_samples)
         return output
 
-    def probabilistic_text(self, text_pooled, text_token, text_valid_mask):
+    def probabilistic_text(self, text_pooled, text_token, text_valid_mask, sample_embeddings=True):
         output = {}
         pad_mask = ~text_valid_mask
         out, attn, residual = self.pie_net_text(text_pooled, text_token, pad_mask=pad_mask)
@@ -424,7 +437,8 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
 
         out = l2_normalize(out)
         output["mean"] = out
-        output["embedding"] = sample_gaussian_tensors(out, logsigma, self.n_text_samples)
+        if sample_embeddings:
+            output["embedding"] = sample_gaussian_tensors(out, logsigma, self.n_text_samples)
         return output
 
     @staticmethod
@@ -437,8 +451,29 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
         ).sum(dim=1) / positive_mask.sum(dim=1).clamp_min(1)
         return sample_losses.view(batch_size, n_query_samples).mean(dim=1)
 
+    @staticmethod
+    def _gaussian_wasserstein_similarity(prob_text, prob_video, logit_scale, tau=1.0):
+        """Negative squared W2 distance between diagonal Gaussian embeddings."""
+        text_mean = prob_text["mean"]
+        video_mean = prob_video["mean"]
+        text_std = prob_text["logsigma"].clamp(-10.0, 10.0).exp()
+        video_std = prob_video["logsigma"].clamp(-10.0, 10.0).exp()
+        mean_distance = (text_mean[:, None, :] - video_mean[None, :, :]).square().mean(dim=-1)
+        std_distance = (text_std[:, None, :] - video_std[None, :, :]).square().mean(dim=-1)
+        return -logit_scale * (mean_distance + std_distance) / max(tau, 1e-6)
+
+    @staticmethod
+    def _analytic_gaussian_kl(prob_output):
+        """Mean KL divergence from a diagonal Gaussian to the unit Gaussian."""
+        mean = prob_output["mean"]
+        log_std = prob_output["logsigma"].clamp(-10.0, 10.0)
+        variance = (2.0 * log_std).exp()
+        per_dimension = mean.square() + variance - 1.0 - 2.0 * log_std
+        return 0.5 * per_dimension.sum(dim=-1).mean()
+
     def compute_uatvr_losses(self, text_hidden, text_valid_mask, video_hidden, video_valid_mask,
-                             logit_scale, return_distribution=False, token_interaction_mode=None):
+                             logit_scale, return_distribution=False, token_interaction_mode=None,
+                             distribution_metric="sampled_mean", distribution_tau=1.0):
         text_token = text_hidden / text_hidden.norm(dim=-1, keepdim=True).clamp_min(1e-6)
         frame_token = video_hidden / video_hidden.norm(dim=-1, keepdim=True).clamp_min(1e-6)
 
@@ -457,8 +492,15 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
                 text_token, frame_token, text_valid_mask, video_valid_mask
             )
 
-        prob_video = self.probabilistic_video(video_pooled, frame_token, video_valid_mask)
-        prob_text = self.probabilistic_text(text_pooled, text_token, text_valid_mask)
+        use_direct_distribution = distribution_metric == "wasserstein"
+        prob_video = self.probabilistic_video(
+            video_pooled, frame_token, video_valid_mask,
+            sample_embeddings=not use_direct_distribution,
+        )
+        prob_text = self.probabilistic_text(
+            text_pooled, text_token, text_valid_mask,
+            sample_embeddings=not use_direct_distribution,
+        )
 
         # Keep the retrieval interface consistent across training/evaluation:
         # rows are texts, columns are videos.
@@ -466,17 +508,24 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
 
         distribution_logits = None
         if return_distribution:
-            text_samples = F.normalize(prob_text["embedding"], dim=-1)
-            video_samples = F.normalize(prob_video["embedding"], dim=-1)
-            batch_text, n_text, dim = text_samples.shape
-            batch_video, n_video, _ = video_samples.shape
-            flat_sim = torch.einsum(
-                "ad,bd->ab",
-                video_samples.reshape(-1, dim),
-                text_samples.reshape(-1, dim),
-            )
-            blocks = flat_sim.view(batch_video, n_video, batch_text, n_text).permute(2, 0, 3, 1)
-            distribution_logits = logit_scale * blocks.mean(dim=(2, 3))
+            if distribution_metric == "wasserstein":
+                distribution_logits = self._gaussian_wasserstein_similarity(
+                    prob_text, prob_video, logit_scale, distribution_tau
+                )
+            else:
+                text_samples = F.normalize(prob_text["embedding"], dim=-1)
+                video_samples = F.normalize(prob_video["embedding"], dim=-1)
+                batch_text, n_text, dim = text_samples.shape
+                batch_video, n_video, _ = video_samples.shape
+                flat_sim = torch.einsum(
+                    "ad,bd->ab",
+                    video_samples.reshape(-1, dim),
+                    text_samples.reshape(-1, dim),
+                )
+                blocks = flat_sim.view(batch_video, n_video, batch_text, n_text).permute(2, 0, 3, 1)
+                distribution_logits = (
+                    logit_scale * blocks.mean(dim=(2, 3)) / max(distribution_tau, 1e-6)
+                )
 
         if not self.training:
             zero = retrieve_logits.new_zeros(())
@@ -487,6 +536,27 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
                 }
                 return retrieve_logits, zero, zero, distribution_logits, mil_query_losses
             return retrieve_logits, zero, zero
+
+        if use_direct_distribution:
+            distribution_query_losses = {
+                "text": -torch.diagonal(F.log_softmax(distribution_logits, dim=-1)),
+                "video": -torch.diagonal(F.log_softmax(distribution_logits.t(), dim=-1)),
+            }
+            distribution_loss = 0.5 * (
+                distribution_query_losses["text"].mean()
+                + distribution_query_losses["video"].mean()
+            )
+            kl_loss = (
+                self._analytic_gaussian_kl(prob_text)
+                + self._analytic_gaussian_kl(prob_video)
+            )
+            return (
+                retrieve_logits,
+                distribution_loss,
+                kl_loss,
+                distribution_logits,
+                distribution_query_losses,
+            )
 
         prob_video_embedding = prob_video["embedding"]
         prob_text_embedding = prob_text["embedding"]

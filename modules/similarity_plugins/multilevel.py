@@ -15,8 +15,19 @@ class MultiLevelSimilarityPlugin:
         self.token_weight = float(getattr(task_config, "sim_token_weight", 1.0))
         self.distribution_weight = float(getattr(task_config, "sim_distribution_weight", 0.0))
         self.global_weight = float(getattr(task_config, "sim_global_weight", 0.0))
+        self.global_pooling = getattr(task_config, "sim_global_pooling", "mean")
+        self.text_global_pooling = (
+            getattr(task_config, "sim_text_global_pooling", None) or self.global_pooling
+        )
+        self.video_global_pooling = (
+            getattr(task_config, "sim_video_global_pooling", None) or self.global_pooling
+        )
+        self.gate_content_pooling = (
+            getattr(task_config, "sim_gate_content_pooling", None) or self.global_pooling
+        )
         self.fusion_norm = getattr(task_config, "sim_fusion_norm", "zscore")
         self.distribution_tau = float(getattr(task_config, "sim_distribution_tau", 1.0))
+        self.distribution_metric = getattr(task_config, "sim_distribution_metric", "sampled_mean")
 
     @property
     def requires_hidden(self):
@@ -55,7 +66,9 @@ class MultiLevelSimilarityPlugin:
 
     def _compute_global_similarity(self, model, text_hidden, text_valid_mask, video_hidden, video_valid_mask, logit_scale):
         return model._compute_global_similarity_matrix(
-            text_hidden, text_valid_mask, video_hidden, video_valid_mask, logit_scale
+            text_hidden, text_valid_mask, video_hidden, video_valid_mask, logit_scale,
+            text_pooling=self.text_global_pooling,
+            video_pooling=self.video_global_pooling,
         )
 
     def _compute_distribution_similarity(self, model, text_hidden, text_valid_mask, video_hidden, video_valid_mask):
@@ -70,8 +83,18 @@ class MultiLevelSimilarityPlugin:
         video_pooled = model._masked_mean_pooling(frame_token, video_valid_mask)
         video_pooled = video_pooled / video_pooled.norm(dim=-1, keepdim=True).clamp_min(1e-6)
 
-        prob_video = model.probabilistic_video(video_pooled, frame_token, video_valid_mask)
-        prob_text = model.probabilistic_text(text_pooled, text_token, text_valid_mask)
+        sample_embeddings = self.distribution_metric != "wasserstein"
+        prob_video = model.probabilistic_video(
+            video_pooled, frame_token, video_valid_mask, sample_embeddings=sample_embeddings
+        )
+        prob_text = model.probabilistic_text(
+            text_pooled, text_token, text_valid_mask, sample_embeddings=sample_embeddings
+        )
+
+        if self.distribution_metric == "wasserstein":
+            return model._gaussian_wasserstein_similarity(
+                prob_text, prob_video, model.clip.logit_scale.exp(), self.distribution_tau
+            )
 
         # Use the same sampled-embedding pairwise similarity source as training:
         # sim(flat_video_samples, flat_text_samples). Since MIL loss itself is
