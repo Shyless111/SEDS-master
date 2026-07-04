@@ -8,6 +8,7 @@ NUM_WORKERS="${NUM_WORKERS:-4}"
 MASTER_PORT="${MASTER_PORT:-29533}"
 RUN_TAG="${RUN_TAG:-default}"
 TEXT_ENCODER_PATH="${TEXT_ENCODER_PATH:-/sda/home/shihaoyu/Projects/MESM/distilbert-base-uncased}"
+USE_CLIP_TEXT_ENCODER="${USE_CLIP_TEXT_ENCODER:-0}"
 USE_UATVR_HEAD="${USE_UATVR_HEAD:-0}"
 UATVR_USE_DSL="${UATVR_USE_DSL:-0}"
 UATVR_DSL_MODE="${UATVR_DSL_MODE:-col}"
@@ -32,8 +33,11 @@ main_task_retrieval.py --do_train --num_thread_reader="${NUM_WORKERS}" \
 --batch_size_val "${BATCH_SIZE_VAL}" \
 --datatype ph_pose --coef_lr 1. --freeze_layer_num 0 \
 --linear_patch 2d --sim_header Filip --filip_only \
---text_encoder_path "${TEXT_ENCODER_PATH}" \
 --pretrained_clip_name ViT-B/32)
+
+if [ "${USE_CLIP_TEXT_ENCODER}" != "1" ]; then
+  CMD+=(--text_encoder_path "${TEXT_ENCODER_PATH}")
+fi
 
 if [ "${USE_UATVR_HEAD}" = "1" ]; then
   CMD+=(--use_uatvr_head \

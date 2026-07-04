@@ -71,7 +71,7 @@ def get_args(description='CLCL on Retrieval Task'):
     parser.add_argument("--filip_retrieval_weight", default=0.5, type=float, help="Weight for FILIP fine-grained similarity during retrieval.")
     parser.add_argument("--filip_chunk_size", default=32, type=int, help="Chunk size for FILIP pairwise token similarity.")
     parser.add_argument("--filip_only", action='store_true', help="Use only FILIP fine-grained similarity for training loss and retrieval.")
-    parser.add_argument("--similarity_plugin", default="base", type=str, choices=["base", "multilevel"],
+    parser.add_argument("--similarity_plugin", default="base", type=str, choices=["base", "multilevel", "qamf", "adaptive_multilevel", "difficulty_multilevel"],
                         help="Optional similarity plugin. `base` keeps current behavior unchanged.")
     parser.add_argument("--sim_token_weight", default=1.0, type=float,
                         help="Fusion weight for token-level similarity in the multilevel plugin.")
@@ -83,6 +83,29 @@ def get_args(description='CLCL on Retrieval Task'):
                         help="Normalization mode before fusing similarity branches in the multilevel plugin.")
     parser.add_argument("--sim_distribution_tau", default=1.0, type=float,
                         help="Temperature/divisor for the distribution-level similarity in the multilevel plugin.")
+    parser.add_argument("--sim_qamf_sigma", default=0.5, type=float,
+                        help="Gaussian decay sigma for the query-adaptive late fusion plugin.")
+    parser.add_argument("--sim_qamf_eps", default=1e-6, type=float,
+                        help="Numerical stability epsilon for the query-adaptive late fusion plugin.")
+    parser.add_argument("--sim_qamf_mode", default="full", type=str, choices=["full", "fixed_global", "adaptive_additive"],
+                        help="QAMF fusion mode: `full` adapts all enabled branches, `fixed_global` keeps global fixed and only adapts token/distribution, `adaptive_additive` uses adaptive additive fusion for token/distribution plus fixed global.")
+    parser.add_argument("--sim_gate_hidden_dim", default=256, type=int,
+                        help="Hidden size of the adaptive multilevel query gate.")
+    parser.add_argument("--sim_gate_temperature", default=1.0, type=float,
+                        help="Softmax temperature of the adaptive multilevel query gate.")
+    parser.add_argument("--sim_gate_min_weight", default=0.05, type=float,
+                        help="Minimum weight assigned to each semantic branch by the query gate.")
+    parser.add_argument("--sim_gate_entropy_weight", default=1e-3, type=float,
+                        help="Entropy regularization weight preventing early gate collapse.")
+    parser.add_argument("--sim_gate_weighted_loss_weight", default=0.5, type=float,
+                        help="Weight of query-gated token/MIL/global losses.")
+    parser.add_argument("--sim_gate_fused_loss_weight", default=0.5, type=float,
+                        help="Weight of the train-test-consistent fused similarity loss.")
+    parser.add_argument("--sim_gate_fusion_norm", default="token_scale", type=str,
+                        choices=["token_scale", "minmax"],
+                        help="Similarity normalization used by adaptive gate fusion.")
+    parser.add_argument("--sim_gate_fusion_temperature", default=0.07, type=float,
+                        help="Logit temperature used after min-max adaptive fusion.")
     parser.add_argument("--mean_nce_weight", default=0.0, type=float, help="Deprecated alias for global alignment weight. Kept for backward compatibility.")
     parser.add_argument("--global_align_weight", default=None, type=float, help="Weight for mean pooled text-video global alignment InfoNCE loss.")
     parser.add_argument("--use_uatvr_head", action='store_true', help="Enable UATVR probabilistic retrieval head.")
@@ -591,6 +614,18 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
                     "train/loss_global": float(loss_global),
                     "train/time_per_step": (time.time() - start_time) / (log_step * args.gradient_accumulation_steps),
                 }
+                raw_model = model.module if hasattr(model, "module") else model
+                if args.similarity_plugin in ("adaptive_multilevel", "difficulty_multilevel") and hasattr(raw_model, "last_gate_text_weights"):
+                    text_gate = raw_model.last_gate_text_weights.cpu().tolist()
+                    video_gate = raw_model.last_gate_video_weights.cpu().tolist()
+                    logger.info(
+                        "Gate mean [token, distribution, global] text=%s video=%s",
+                        [round(value, 4) for value in text_gate],
+                        [round(value, 4) for value in video_gate],
+                    )
+                    for index, name in enumerate(("token", "distribution", "global")):
+                        metrics["train/gate_text_{}".format(name)] = text_gate[index]
+                        metrics["train/gate_video_{}".format(name)] = video_gate[index]
                 if args.sim_header == "Filip" and not args.use_pose:
                     metrics["train/loss_fg"] = float(loss_tf)
                 else:
@@ -607,6 +642,50 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
 def _run_on_single_gpu_new_mix(model, batch_list_v, batch_list_t, batch_sequence_output_list, batch_visual_output_pose_list, batch_visual_output_rgb_list, is_train, hybird=False, alpha=0.5, dual_mix=0.5):
 
     with torch.no_grad():
+        plugin = getattr(model, "similarity_plugin", None)
+        if (plugin is not None
+                and getattr(plugin, "requires_global_inference_fusion", False)
+                and batch_visual_output_pose_list is None):
+            plugin.clear_inference_cache()
+            branch_rows = [[], [], []]
+            text_weight_rows = []
+            video_weight_rows = []
+            logit_scale = model.clip.logit_scale.exp()
+
+            for idx2, _ in enumerate(batch_list_t):
+                text_outputs = batch_sequence_output_list[idx2]
+                row_blocks = [[], [], []]
+                for idx1, _ in enumerate(batch_list_v):
+                    video_outputs = batch_visual_output_rgb_list[idx1]
+                    components = plugin.compute_inference_components(
+                        model,
+                        text_outputs["global"],
+                        video_outputs["global"],
+                        text_outputs.get("hidden"),
+                        text_outputs.get("valid_mask"),
+                        video_outputs.get("hidden"),
+                        video_outputs.get("valid_mask"),
+                        logit_scale,
+                    )
+                    for branch_index, sim in enumerate(components["branch_sims"]):
+                        row_blocks[branch_index].append(sim.cpu())
+                    if idx1 == 0:
+                        text_weight_rows.append(components["text_weights"].cpu())
+                    if idx2 == 0:
+                        video_weight_rows.append(components["video_weights"].cpu())
+
+                for branch_index in range(3):
+                    branch_rows[branch_index].append(torch.cat(row_blocks[branch_index], dim=-1))
+
+            full_branches = tuple(torch.cat(rows, dim=0) for rows in branch_rows)
+            text_weights = torch.cat(text_weight_rows, dim=0)
+            video_weights = torch.cat(video_weight_rows, dim=0)
+            fused = plugin.fuse_full_inference_matrices(
+                full_branches, text_weights, video_weights
+            )
+            plugin.clear_inference_cache()
+            return [fused.numpy()], None, None
+
         sim_matrix_tv = []
         sim_matrix_tp = []
         sim_matrix_tf = []
