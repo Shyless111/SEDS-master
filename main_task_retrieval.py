@@ -92,8 +92,8 @@ def get_args(description='CLCL on Retrieval Task'):
     parser.add_argument("--sim_distribution_tau", default=1.0, type=float,
                         help="Temperature/divisor for the distribution-level similarity in the multilevel plugin.")
     parser.add_argument("--sim_distribution_metric", default="sampled_mean", type=str,
-                        choices=["sampled_mean", "wasserstein"],
-                        help="Distribution similarity: sampled embedding mean or diagonal-Gaussian Wasserstein distance.")
+                        choices=["sampled_mean", "wasserstein", "bhattacharyya"],
+                        help="Distribution similarity for sampled or analytic diagonal-Gaussian embeddings.")
     parser.add_argument("--sim_qamf_sigma", default=0.5, type=float,
                         help="Gaussian decay sigma for the query-adaptive late fusion plugin.")
     parser.add_argument("--sim_qamf_eps", default=1e-6, type=float,

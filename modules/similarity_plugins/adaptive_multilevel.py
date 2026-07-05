@@ -67,14 +67,17 @@ class AdaptiveMultiLevelSimilarityPlugin(nn.Module, MultiLevelSimilarityPlugin):
         tokens = F.normalize(hidden, dim=-1)
         pooled = model._masked_mean_pooling(tokens, valid_mask)
         pooled = F.normalize(pooled, dim=-1)
-        sample_embeddings = self.distribution_metric != "wasserstein"
+        sample_embeddings = self.distribution_metric not in ("wasserstein", "bhattacharyya")
+        normalize_mean = sample_embeddings
         if modality == "text":
             output = model.probabilistic_text(
-                pooled, tokens, valid_mask, sample_embeddings=sample_embeddings
+                pooled, tokens, valid_mask, sample_embeddings=sample_embeddings,
+                normalize_mean=normalize_mean,
             )
         else:
             output = model.probabilistic_video(
-                pooled, tokens, valid_mask, sample_embeddings=sample_embeddings
+                pooled, tokens, valid_mask, sample_embeddings=sample_embeddings,
+                normalize_mean=normalize_mean,
             )
         cache[key] = output
         return output
@@ -102,6 +105,10 @@ class AdaptiveMultiLevelSimilarityPlugin(nn.Module, MultiLevelSimilarityPlugin):
         )
         if self.distribution_metric == "wasserstein":
             distribution_sim = model._gaussian_wasserstein_similarity(
+                prob_text, prob_video, logit_scale, self.distribution_tau
+            )
+        elif self.distribution_metric == "bhattacharyya":
+            distribution_sim = model._gaussian_bhattacharyya_similarity(
                 prob_text, prob_video, logit_scale, self.distribution_tau
             )
         else:

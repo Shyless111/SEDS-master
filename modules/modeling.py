@@ -5,6 +5,7 @@ from __future__ import print_function
 import os
 import logging
 import copy
+import math
 import torch
 import pickle as pkl
 from torch import nn
@@ -405,7 +406,8 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
         v2t_logits = torch.sum(v2t_logits, dim=2) / video_sum.unsqueeze(0)
         return (t2v_logits + v2t_logits) / 2.0
 
-    def probabilistic_video(self, video_pooled, videos, video_valid_mask, sample_embeddings=True):
+    def probabilistic_video(self, video_pooled, videos, video_valid_mask, sample_embeddings=True,
+                            normalize_mean=True):
         output = {}
         pad_mask = ~video_valid_mask
         out, attn, residual = self.pie_net_video(video_pooled, videos, pad_mask=pad_mask)
@@ -417,13 +419,15 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
         output["logsigma"] = logsigma
         output["uncertainty_attention"] = uncertain_out["attention"]
 
-        out = l2_normalize(out)
+        if normalize_mean:
+            out = l2_normalize(out)
         output["mean"] = out
         if sample_embeddings:
             output["embedding"] = sample_gaussian_tensors(out, logsigma, self.n_video_samples)
         return output
 
-    def probabilistic_text(self, text_pooled, text_token, text_valid_mask, sample_embeddings=True):
+    def probabilistic_text(self, text_pooled, text_token, text_valid_mask, sample_embeddings=True,
+                           normalize_mean=True):
         output = {}
         pad_mask = ~text_valid_mask
         out, attn, residual = self.pie_net_text(text_pooled, text_token, pad_mask=pad_mask)
@@ -435,7 +439,8 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
         output["logsigma"] = logsigma
         output["uncertainty_attention"] = uncertain_out["attention"]
 
-        out = l2_normalize(out)
+        if normalize_mean:
+            out = l2_normalize(out)
         output["mean"] = out
         if sample_embeddings:
             output["embedding"] = sample_gaussian_tensors(out, logsigma, self.n_text_samples)
@@ -461,6 +466,30 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
         mean_distance = (text_mean[:, None, :] - video_mean[None, :, :]).square().mean(dim=-1)
         std_distance = (text_std[:, None, :] - video_std[None, :, :]).square().mean(dim=-1)
         return -logit_scale * (mean_distance + std_distance) / max(tau, 1e-6)
+
+    @staticmethod
+    def _gaussian_bhattacharyya_similarity(prob_text, prob_video, logit_scale, tau=1.0):
+        """Negative Bhattacharyya distance between diagonal Gaussian embeddings."""
+        text_mean = prob_text["mean"].float()
+        video_mean = prob_video["mean"].float()
+        text_log_var = 2.0 * prob_text["logsigma"].float().clamp(-10.0, 10.0)
+        video_log_var = 2.0 * prob_video["logsigma"].float().clamp(-10.0, 10.0)
+
+        # log((var_t + var_v) / 2), evaluated in log space for stability.
+        log_mean_var = torch.logaddexp(
+            text_log_var[:, None, :], video_log_var[None, :, :]
+        ) - math.log(2.0)
+        mean_delta = text_mean[:, None, :] - video_mean[None, :, :]
+        inverse_mean_var = torch.exp((-log_mean_var).clamp(max=80.0))
+        mean_term = 0.125 * mean_delta.square() * inverse_mean_var
+        covariance_term = 0.5 * (
+            log_mean_var
+            - 0.5 * (
+                text_log_var[:, None, :] + video_log_var[None, :, :]
+            )
+        )
+        distance = (mean_term + covariance_term).mean(dim=-1).clamp_min(0.0)
+        return -logit_scale.float() * distance / max(tau, 1e-6)
 
     @staticmethod
     def _analytic_gaussian_kl(prob_output):
@@ -492,14 +521,19 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
                 text_token, frame_token, text_valid_mask, video_valid_mask
             )
 
-        use_direct_distribution = distribution_metric == "wasserstein"
+        use_direct_distribution = distribution_metric in ("wasserstein", "bhattacharyya")
+        # Analytic Gaussian distances operate in the learned Euclidean space;
+        # normalizing mu would change both their geometry and the unit-Gaussian KL.
+        normalize_distribution_mean = not use_direct_distribution
         prob_video = self.probabilistic_video(
             video_pooled, frame_token, video_valid_mask,
             sample_embeddings=not use_direct_distribution,
+            normalize_mean=normalize_distribution_mean,
         )
         prob_text = self.probabilistic_text(
             text_pooled, text_token, text_valid_mask,
             sample_embeddings=not use_direct_distribution,
+            normalize_mean=normalize_distribution_mean,
         )
 
         # Keep the retrieval interface consistent across training/evaluation:
@@ -510,6 +544,10 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
         if return_distribution:
             if distribution_metric == "wasserstein":
                 distribution_logits = self._gaussian_wasserstein_similarity(
+                    prob_text, prob_video, logit_scale, distribution_tau
+                )
+            elif distribution_metric == "bhattacharyya":
+                distribution_logits = self._gaussian_bhattacharyya_similarity(
                     prob_text, prob_video, logit_scale, distribution_tau
                 )
             else:

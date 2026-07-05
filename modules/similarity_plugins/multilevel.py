@@ -83,16 +83,23 @@ class MultiLevelSimilarityPlugin:
         video_pooled = model._masked_mean_pooling(frame_token, video_valid_mask)
         video_pooled = video_pooled / video_pooled.norm(dim=-1, keepdim=True).clamp_min(1e-6)
 
-        sample_embeddings = self.distribution_metric != "wasserstein"
+        sample_embeddings = self.distribution_metric not in ("wasserstein", "bhattacharyya")
+        normalize_mean = sample_embeddings
         prob_video = model.probabilistic_video(
-            video_pooled, frame_token, video_valid_mask, sample_embeddings=sample_embeddings
+            video_pooled, frame_token, video_valid_mask, sample_embeddings=sample_embeddings,
+            normalize_mean=normalize_mean,
         )
         prob_text = model.probabilistic_text(
-            text_pooled, text_token, text_valid_mask, sample_embeddings=sample_embeddings
+            text_pooled, text_token, text_valid_mask, sample_embeddings=sample_embeddings,
+            normalize_mean=normalize_mean,
         )
 
         if self.distribution_metric == "wasserstein":
             return model._gaussian_wasserstein_similarity(
+                prob_text, prob_video, model.clip.logit_scale.exp(), self.distribution_tau
+            )
+        if self.distribution_metric == "bhattacharyya":
+            return model._gaussian_bhattacharyya_similarity(
                 prob_text, prob_video, model.clip.logit_scale.exp(), self.distribution_tau
             )
 
