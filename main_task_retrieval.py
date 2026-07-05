@@ -71,7 +71,7 @@ def get_args(description='CLCL on Retrieval Task'):
     parser.add_argument("--filip_retrieval_weight", default=0.5, type=float, help="Weight for FILIP fine-grained similarity during retrieval.")
     parser.add_argument("--filip_chunk_size", default=32, type=int, help="Chunk size for FILIP pairwise token similarity.")
     parser.add_argument("--filip_only", action='store_true', help="Use only FILIP fine-grained similarity for training loss and retrieval.")
-    parser.add_argument("--similarity_plugin", default="base", type=str, choices=["base", "multilevel", "qamf", "adaptive_multilevel", "difficulty_multilevel"],
+    parser.add_argument("--similarity_plugin", default="base", type=str, choices=["base", "multilevel", "qamf", "adaptive_multilevel", "difficulty_multilevel", "evidence_multilevel"],
                         help="Optional similarity plugin. `base` keeps current behavior unchanged.")
     parser.add_argument("--sim_token_weight", default=1.0, type=float,
                         help="Fusion weight for token-level similarity in the multilevel plugin.")
@@ -87,6 +87,10 @@ def get_args(description='CLCL on Retrieval Task'):
                         help="Optional video-side override for multilevel global pooling.")
     parser.add_argument("--sim_gate_content_pooling", default=None, type=str, choices=["mean", "cls"],
                         help="Optional content-summary override used by query-adaptive gates.")
+    parser.add_argument("--sim_text_gate_content_pooling", default=None, type=str, choices=["mean", "cls"],
+                        help="Optional text-side content pooling override used by query gates.")
+    parser.add_argument("--sim_video_gate_content_pooling", default=None, type=str, choices=["mean", "cls"],
+                        help="Optional video-side content pooling override used by query gates.")
     parser.add_argument("--sim_fusion_norm", default="zscore", type=str, choices=["none", "zscore"],
                         help="Normalization mode before fusing similarity branches in the multilevel plugin.")
     parser.add_argument("--sim_distribution_tau", default=1.0, type=float,
@@ -102,6 +106,8 @@ def get_args(description='CLCL on Retrieval Task'):
                         help="QAMF fusion mode: `full` adapts all enabled branches, `fixed_global` keeps global fixed and only adapts token/distribution, `adaptive_additive` uses adaptive additive fusion for token/distribution plus fixed global.")
     parser.add_argument("--sim_gate_hidden_dim", default=256, type=int,
                         help="Hidden size of the adaptive multilevel query gate.")
+    parser.add_argument("--sim_gate_dropout", default=0.1, type=float,
+                        help="Dropout used by evidence-aware query gates.")
     parser.add_argument("--sim_gate_temperature", default=1.0, type=float,
                         help="Softmax temperature of the adaptive multilevel query gate.")
     parser.add_argument("--sim_gate_min_weight", default=0.05, type=float,
@@ -626,7 +632,7 @@ def train_epoch(epoch, args, model, train_dataloader, device, n_gpu, optimizer, 
                     "train/time_per_step": (time.time() - start_time) / (log_step * args.gradient_accumulation_steps),
                 }
                 raw_model = model.module if hasattr(model, "module") else model
-                if args.similarity_plugin in ("adaptive_multilevel", "difficulty_multilevel") and hasattr(raw_model, "last_gate_text_weights"):
+                if args.similarity_plugin in ("adaptive_multilevel", "difficulty_multilevel", "evidence_multilevel") and hasattr(raw_model, "last_gate_text_weights"):
                     text_gate = raw_model.last_gate_text_weights.cpu().tolist()
                     video_gate = raw_model.last_gate_video_weights.cpu().tolist()
                     logger.info(

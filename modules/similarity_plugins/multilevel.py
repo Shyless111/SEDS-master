@@ -25,6 +25,14 @@ class MultiLevelSimilarityPlugin:
         self.gate_content_pooling = (
             getattr(task_config, "sim_gate_content_pooling", None) or self.global_pooling
         )
+        self.text_gate_content_pooling = (
+            getattr(task_config, "sim_text_gate_content_pooling", None)
+            or self.gate_content_pooling
+        )
+        self.video_gate_content_pooling = (
+            getattr(task_config, "sim_video_gate_content_pooling", None)
+            or self.gate_content_pooling
+        )
         self.fusion_norm = getattr(task_config, "sim_fusion_norm", "zscore")
         self.distribution_tau = float(getattr(task_config, "sim_distribution_tau", 1.0))
         self.distribution_metric = getattr(task_config, "sim_distribution_metric", "sampled_mean")

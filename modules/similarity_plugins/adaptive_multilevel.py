@@ -47,12 +47,18 @@ class AdaptiveMultiLevelSimilarityPlugin(nn.Module, MultiLevelSimilarityPlugin):
         return floor + (1.0 - 3.0 * floor) * weights
 
     def _compute_text_weights(self, model, hidden, valid_mask):
-        query = hidden[:, 0] if self.gate_content_pooling == "cls" else model._masked_mean_pooling(hidden, valid_mask)
+        query = hidden[:, 0] if self.text_gate_content_pooling == "cls" else model._masked_mean_pooling(hidden, valid_mask)
         return self._query_weights(query)
 
     def _compute_video_weights(self, model, hidden, valid_mask):
-        query = hidden[:, 0] if self.gate_content_pooling == "cls" else model._masked_mean_pooling(hidden, valid_mask)
+        query = hidden[:, 0] if self.video_gate_content_pooling == "cls" else model._masked_mean_pooling(hidden, valid_mask)
         return self._query_weights(query)
+
+    def _compute_text_evidence_weights(self, model, hidden, valid_mask, probability_output):
+        return self._compute_text_weights(model, hidden, valid_mask)
+
+    def _compute_video_evidence_weights(self, model, hidden, valid_mask, probability_output):
+        return self._compute_video_weights(model, hidden, valid_mask)
 
     @staticmethod
     def _cache_key(hidden):
@@ -130,8 +136,12 @@ class AdaptiveMultiLevelSimilarityPlugin(nn.Module, MultiLevelSimilarityPlugin):
         )
         return {
             "branch_sims": (token_sim, distribution_sim, global_sim),
-            "text_weights": self._compute_text_weights(model, text_hidden, text_valid_mask),
-            "video_weights": self._compute_video_weights(model, video_hidden, video_valid_mask),
+            "text_weights": self._compute_text_evidence_weights(
+                model, text_hidden, text_valid_mask, prob_text
+            ),
+            "video_weights": self._compute_video_evidence_weights(
+                model, video_hidden, video_valid_mask, prob_video
+            ),
         }
 
     def fuse_full_inference_matrices(self, branch_sims, text_weights, video_weights):
@@ -162,17 +172,24 @@ class AdaptiveMultiLevelSimilarityPlugin(nn.Module, MultiLevelSimilarityPlugin):
                        video_hidden, video_valid_mask, logit_scale):
         if not model.use_uatvr_head:
             raise ValueError("adaptive_multilevel requires --use_uatvr_head")
-        token_sim, mil_loss, kl_loss, distribution_sim, mil_query_losses = model.compute_uatvr_losses(
+        token_sim, mil_loss, kl_loss, distribution_sim, mil_query_losses, probability_outputs = model.compute_uatvr_losses(
             text_hidden, text_valid_mask, video_hidden, video_valid_mask,
             logit_scale, return_distribution=True,
             token_interaction_mode=getattr(model.task_config, "token_interaction_mode", "weighted"),
             distribution_metric=self.distribution_metric,
             distribution_tau=self.distribution_tau,
+            return_probability_outputs=True,
         )
         global_sim = self._compute_global_similarity(
             model, text_hidden, text_valid_mask, video_hidden, video_valid_mask, logit_scale
         )
-        return (token_sim, distribution_sim, global_sim), mil_loss, kl_loss, mil_query_losses
+        return (
+            (token_sim, distribution_sim, global_sim),
+            mil_loss,
+            kl_loss,
+            mil_query_losses,
+            probability_outputs,
+        )
 
     def _directional_weighted_loss(self, branch_sims, distribution_loss, query_weights):
         losses = torch.stack(
@@ -190,12 +207,16 @@ class AdaptiveMultiLevelSimilarityPlugin(nn.Module, MultiLevelSimilarityPlugin):
 
     def compute_training_loss(self, model, text_global, video_global, text_hidden,
                               text_valid_mask, video_hidden, video_valid_mask, logit_scale):
-        branch_sims, mil_loss, kl_loss, mil_query_losses = self._branch_logits(
+        branch_sims, mil_loss, kl_loss, mil_query_losses, probability_outputs = self._branch_logits(
             model, text_global, video_global, text_hidden, text_valid_mask,
             video_hidden, video_valid_mask, logit_scale
         )
-        text_weights = self._compute_text_weights(model, text_hidden, text_valid_mask)
-        video_weights = self._compute_video_weights(model, video_hidden, video_valid_mask)
+        text_weights = self._compute_text_evidence_weights(
+            model, text_hidden, text_valid_mask, probability_outputs["text"]
+        )
+        video_weights = self._compute_video_evidence_weights(
+            model, video_hidden, video_valid_mask, probability_outputs["video"]
+        )
 
         loss_t2v = self._directional_weighted_loss(
             branch_sims, mil_query_losses["text"], text_weights
@@ -269,12 +290,16 @@ class AdaptiveMultiLevelSimilarityPlugin(nn.Module, MultiLevelSimilarityPlugin):
                 components["text_weights"],
                 components["video_weights"],
             )
-        branch_sims, _, _, _ = self._branch_logits(
+        branch_sims, _, _, _, probability_outputs = self._branch_logits(
             model, text_global, video_global, text_hidden, text_valid_mask,
             video_hidden, video_valid_mask, logit_scale
         )
-        text_weights = self._compute_text_weights(model, text_hidden, text_valid_mask)
-        video_weights = self._compute_video_weights(model, video_hidden, video_valid_mask)
+        text_weights = self._compute_text_evidence_weights(
+            model, text_hidden, text_valid_mask, probability_outputs["text"]
+        )
+        video_weights = self._compute_video_evidence_weights(
+            model, video_hidden, video_valid_mask, probability_outputs["video"]
+        )
         fused_t2v = self._fuse_direction(branch_sims, text_weights)
         transposed = tuple(sim.t().contiguous() for sim in branch_sims)
         fused_v2t = self._fuse_direction(transposed, video_weights).t().contiguous()

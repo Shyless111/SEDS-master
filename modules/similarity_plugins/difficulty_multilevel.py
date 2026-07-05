@@ -62,17 +62,26 @@ class DifficultyAwareMultiLevelSimilarityPlugin(AdaptiveMultiLevelSimilarityPlug
             dim=-1,
         )
 
-    def _weights_from_gate(self, gate, hidden, valid_mask):
-        features = self._structural_features(
-            hidden, valid_mask, content_pooling=self.gate_content_pooling
-        )
+    def _weights_from_features(self, gate, features):
         logits = gate(features) / max(self.gate_temperature, 1e-6)
         weights = F.softmax(logits, dim=-1)
         floor = min(max(self.gate_min_weight, 0.0), 1.0 / 3.0)
         return floor + (1.0 - 3.0 * floor) * weights
 
+    def _weights_from_gate(self, gate, hidden, valid_mask):
+        features = self._structural_features(
+            hidden, valid_mask, content_pooling=self.gate_content_pooling
+        )
+        return self._weights_from_features(gate, features)
+
     def _compute_text_weights(self, model, hidden, valid_mask):
-        return self._weights_from_gate(self.text_gate, hidden, valid_mask)
+        features = self._structural_features(
+            hidden, valid_mask, content_pooling=self.text_gate_content_pooling
+        )
+        return self._weights_from_features(self.text_gate, features)
 
     def _compute_video_weights(self, model, hidden, valid_mask):
-        return self._weights_from_gate(self.video_gate, hidden, valid_mask)
+        features = self._structural_features(
+            hidden, valid_mask, content_pooling=self.video_gate_content_pooling
+        )
+        return self._weights_from_features(self.video_gate, features)

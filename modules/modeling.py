@@ -240,7 +240,7 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
             )
 
         self.apply(self.init_weights)
-        if getattr(task_config, "similarity_plugin", "base") in ("adaptive_multilevel", "difficulty_multilevel"):
+        if getattr(task_config, "similarity_plugin", "base") in ("adaptive_multilevel", "difficulty_multilevel", "evidence_multilevel"):
             self.similarity_plugin.reset_gate_output()
 
         if self.use_hf_text_encoder:
@@ -502,7 +502,8 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
 
     def compute_uatvr_losses(self, text_hidden, text_valid_mask, video_hidden, video_valid_mask,
                              logit_scale, return_distribution=False, token_interaction_mode=None,
-                             distribution_metric="sampled_mean", distribution_tau=1.0):
+                             distribution_metric="sampled_mean", distribution_tau=1.0,
+                             return_probability_outputs=False):
         text_token = text_hidden / text_hidden.norm(dim=-1, keepdim=True).clamp_min(1e-6)
         frame_token = video_hidden / video_hidden.norm(dim=-1, keepdim=True).clamp_min(1e-6)
 
@@ -535,6 +536,12 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
             sample_embeddings=not use_direct_distribution,
             normalize_mean=normalize_distribution_mean,
         )
+        probability_outputs = {"text": prob_text, "video": prob_video}
+
+        def pack(values):
+            if return_probability_outputs:
+                return (*values, probability_outputs)
+            return values
 
         # Keep the retrieval interface consistent across training/evaluation:
         # rows are texts, columns are videos.
@@ -572,8 +579,8 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
                     "text": retrieve_logits.new_zeros(retrieve_logits.size(0)),
                     "video": retrieve_logits.new_zeros(retrieve_logits.size(1)),
                 }
-                return retrieve_logits, zero, zero, distribution_logits, mil_query_losses
-            return retrieve_logits, zero, zero
+                return pack((retrieve_logits, zero, zero, distribution_logits, mil_query_losses))
+            return pack((retrieve_logits, zero, zero))
 
         if use_direct_distribution:
             distribution_query_losses = {
@@ -588,13 +595,13 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
                 self._analytic_gaussian_kl(prob_text)
                 + self._analytic_gaussian_kl(prob_video)
             )
-            return (
+            return pack((
                 retrieve_logits,
                 distribution_loss,
                 kl_loss,
                 distribution_logits,
                 distribution_query_losses,
-            )
+            ))
 
         prob_video_embedding = prob_video["embedding"]
         prob_text_embedding = prob_text["embedding"]
@@ -635,8 +642,8 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
                 "text": mil_loss_per_text,
                 "video": mil_loss_per_video,
             }
-            return retrieve_logits, mil_loss, kl_loss, distribution_logits, mil_query_losses
-        return retrieve_logits, mil_loss, kl_loss
+            return pack((retrieve_logits, mil_loss, kl_loss, distribution_logits, mil_query_losses))
+        return pack((retrieve_logits, mil_loss, kl_loss))
 
     def forward(self, input_ids, token_type_ids, attention_mask, right_batch, left_batch, body_batch):
         input_ids = input_ids.view(-1, input_ids.shape[-1])
@@ -681,7 +688,7 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
             torch.distributed.barrier()
 
         logit_scale = self.clip.logit_scale.exp()
-        if (getattr(self.task_config, "similarity_plugin", "base") in ("adaptive_multilevel", "difficulty_multilevel")
+        if (getattr(self.task_config, "similarity_plugin", "base") in ("adaptive_multilevel", "difficulty_multilevel", "evidence_multilevel")
                 and text_hidden is not None and video_hidden is not None and not self.use_pose):
             total_loss, plugin_details = self.similarity_plugin.compute_training_loss(
                 self, text_global, video_global, text_hidden, text_valid_mask,

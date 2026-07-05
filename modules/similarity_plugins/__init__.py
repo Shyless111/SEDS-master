@@ -2,6 +2,7 @@ from modules.similarity_plugins.multilevel import MultiLevelSimilarityPlugin
 from modules.similarity_plugins.qamf import QueryAdaptiveLateFusionPlugin
 from modules.similarity_plugins.adaptive_multilevel import AdaptiveMultiLevelSimilarityPlugin
 from modules.similarity_plugins.difficulty_multilevel import DifficultyAwareMultiLevelSimilarityPlugin
+from modules.similarity_plugins.evidence_multilevel import EvidenceAwareMultiLevelSimilarityPlugin
 
 
 def build_similarity_plugin(task_config, embed_dim=None):
@@ -18,4 +19,8 @@ def build_similarity_plugin(task_config, embed_dim=None):
         if embed_dim is None:
             raise ValueError("difficulty_multilevel requires the model embedding dimension")
         return DifficultyAwareMultiLevelSimilarityPlugin(task_config, embed_dim)
+    if plugin_name == "evidence_multilevel":
+        if embed_dim is None:
+            raise ValueError("evidence_multilevel requires the model embedding dimension")
+        return EvidenceAwareMultiLevelSimilarityPlugin(task_config, embed_dim)
     return None
